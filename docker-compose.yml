@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  hermes-bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_FILE=/app/data/mtproto_leads.json
