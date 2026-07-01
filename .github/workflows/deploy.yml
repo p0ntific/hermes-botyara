@@ -9,29 +9,27 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        
+      - name: Copy Files to Server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "tg_lead_skill.py"
+          target: "~/.hermes/"
+          
+      - name: Restart Service
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
-            # Navigate to the deployment directory (create if not exists)
-            mkdir -p ~/.hermes-repo
-            cd ~/.hermes-repo
-            
-            # Clone or pull the latest code
-            if [ -d ".git" ]; then
-              git pull origin main
-            else
-              git clone https://github.com/p0ntific/hermes-botyara.git .
-            fi
-            
-            # Since the user currently runs via bare python script / systemd --user:
-            # We copy the script to the location the systemd service expects (~/.hermes/)
-            cp tg_lead_skill.py ~/.hermes/tg_lead_skill.py
-            
-            # Note: We assume .env is placed inside ~/.hermes/.env manually on the server once.
+            # Ensure python-dotenv is installed just in case
+            ~/.local/bin/pip3 install python-dotenv --user --break-system-packages
             
             # Restart the service
             systemctl --user daemon-reload
