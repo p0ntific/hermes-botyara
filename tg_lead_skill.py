@@ -77,18 +77,15 @@ def can_message_today(db):
     count_today = sum(1 for v in db["contacted"].values() if v.get("date") == today)
     return count_today < 25
 
-def notify_via_bot(message):
-    if not BOT_TOKEN or not BOT_CHAT_ID:
+
+
+async def notify_admin(client, message):
+    if not BOT_CHAT_ID:
         return
-        
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-    
-    payload = {"chat_id": BOT_CHAT_ID, "text": message}
     try:
-        requests.post(url, json=payload, proxies=proxies, timeout=10)
+        await client.send_message(int(BOT_CHAT_ID), message)
     except Exception as e:
-        logger.error(f"Failed to send bot notification: {e}")
+        logger.error(f"Failed to send admin notification via MTProto: {e}")
 
 def generate_pitch(lead_context):
     system_prompt = f"""Ты эксперт по B2B продажам. Твоя задача — написать первое сообщение для потенциального клиента (лида) в Telegram.
@@ -138,9 +135,8 @@ def generate_pitch(lead_context):
         elif "<think>" in output:
             return None
 
-        output = re.sub(r"^```(?:markdown)?\n", "", output)
-        output = re.sub(r"^```\n?", "", output)
-        output = re.sub(r"\n```$", "", output)
+        output = re.sub(r"^```[a-zA-Z]*\s*", "", output)
+        output = re.sub(r"\s*```\s*$", "", output)
         return output.strip()
     except Exception as e:
         logger.error(f"Failed to generate pitch via Yandex Cloud: {e}")
@@ -296,17 +292,17 @@ async def main():
                 save_db(db)
                 
             logger.info(f"Successfully pitched {target_user}")
-            notify_via_bot(f"Отправлен сгенерированный питч новому лиду: @{target_user}\n\nТекст питча:\n{pitch_message}")
+            await notify_admin(client, f"Отправлен сгенерированный питч новому лиду: @{target_user}\n\nТекст питча:\n{pitch_message}")
             
         except errors.FloodWaitError as e:
             logger.error(f"Flood wait error. Must wait {e.seconds} seconds.")
             cooldown_until = time.time() + e.seconds + 60
-            notify_via_bot(f"⚠️ Telegram Flood Wait: пауза {e.seconds} секунд.")
+            await notify_admin(client, f"⚠️ Telegram Flood Wait: пауза {e.seconds} секунд.")
         except Exception as e:
             if "Too many requests" in str(e):
                 logger.error(f"Failed to send pitch to {target_user}: Too many requests")
                 cooldown_until = time.time() + 3600
-                notify_via_bot(f"⚠️ Telegram Limit: Too Many Requests при попытке написать @{target_user}. Пауза 1 час.")
+                await notify_admin(client, f"⚠️ Telegram Limit: Too Many Requests при попытке написать @{target_user}. Пауза 1 час.")
             else:
                 logger.error(f"Failed to send pitch to {target_user}: {e}")
         finally:
@@ -381,21 +377,21 @@ async def main():
                             bot_msg = f"📩 Ответ от лида @{sender_username}:\n\n{msg}\n\n🤖 Бот ответил ({new_count}/10):\n{reply_text}"
                             if ai_response.get("requires_action"):
                                 bot_msg += f"\n\n⚠️ ТРЕБУЕТСЯ ДЕЙСТВИЕ: {ai_response.get('action_reason', '')}"
-                            notify_via_bot(bot_msg)
+                            await notify_admin(client, bot_msg)
                             
                             if ai_response.get("notify_manager"):
                                 try:
                                     manager_msg = f"Этот юзернейм @{sender_username} ожидает созвон/сообщение.\nВот его последнее сообщение:\n\n{msg}"
                                     await client.send_message(MANAGER_USERNAME, manager_msg)
                                     logger.info(f"Notified manager @{MANAGER_USERNAME} about lead {sender_username}")
-                                    notify_via_bot(f"✅ Сообщение успешно отправлено менеджеру @{MANAGER_USERNAME} по лиду @{sender_username}")
+                                    await notify_admin(client, f"✅ Сообщение успешно отправлено менеджеру @{MANAGER_USERNAME} по лиду @{sender_username}")
                                 except Exception as mgr_err:
                                     logger.error(f"Failed to notify manager @{MANAGER_USERNAME}: {mgr_err}")
-                                    notify_via_bot(f"❌ ОШИБКА отправки сообщения менеджеру @{MANAGER_USERNAME} по лиду @{sender_username}: {mgr_err}")
+                                    await notify_admin(client, f"❌ ОШИБКА отправки сообщения менеджеру @{MANAGER_USERNAME} по лиду @{sender_username}: {mgr_err}")
                                     
                         except errors.FloodWaitError as e:
                             logger.error(f"FloodWait when replying: {e.seconds}s")
-                            notify_via_bot(f"⚠️ Telegram Flood Wait при попытке ответить лиду @{sender_username}. Ожидание {e.seconds}s.")
+                            await notify_admin(client, f"⚠️ Telegram Flood Wait при попытке ответить лиду @{sender_username}. Ожидание {e.seconds}s.")
                         except Exception as e:
                             logger.error(f"Error replying to {sender_username}: {e}")
                     else:
@@ -406,9 +402,9 @@ async def main():
                             user_data["reply_count"] = 999
                             save_db(db)
                         bot_msg = f"📩 Ответ от лида @{sender_username}:\n\n{msg}\n\n🤖 Бот ПРОИГНОРИРОВАЛ сообщение (негатив/бот/спам) и больше не напишет."
-                        notify_via_bot(bot_msg)
+                        await notify_admin(client, bot_msg)
                 else:
-                    notify_via_bot(f"📩 Ответ от лида @{sender_username}:\n\n{msg}\n\n⚠️ Ошибка авто-генерации ответа (JSON)!")
+                    await notify_admin(client, f"📩 Ответ от лида @{sender_username}:\n\n{msg}\n\n⚠️ Ошибка авто-генерации ответа (JSON)!")
 
     await client.start()
     logger.info("MTProto Lead Skill started. Listening for leads...")
