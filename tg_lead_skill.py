@@ -103,10 +103,17 @@ async def mark_lead_processed(target_user, status):
         save_db(db)
 
 def extract_target_username(text):
-    for line in text.splitlines()[:8]:
+    separator = "────────────────────"
+    parts = text.split(separator)
+    for block in parts[1::2]:
+        username_match = re.search(r'@([A-Za-z0-9_]{5,32})\)', block)
+        if username_match:
+            return username_match.group(1)
+
+    for line in text.splitlines()[:20]:
         if "👤" not in line:
             continue
-        username_match = re.search(r'@([a-zA-Z0-9_]{5,32})', line)
+        username_match = re.search(r'@([A-Za-z0-9_]{5,32})\)', line)
         if username_match:
             return username_match.group(1)
     return None
