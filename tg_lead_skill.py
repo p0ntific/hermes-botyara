@@ -83,8 +83,24 @@ def can_message_today(db):
     if db.get("last_reset") != today:
         db["last_reset"] = today
     
-    count_today = sum(1 for v in db["contacted"].values() if v.get("date") == today)
+    count_today = sum(
+        1
+        for v in db["contacted"].values()
+        if v.get("date") == today and v.get("status") != "manual_required"
+    )
     return count_today < COLD_DM_DAILY_LIMIT
+
+async def mark_lead_processed(target_user, status):
+    async with db_lock:
+        db = load_db()
+        db["contacted"][str(target_user)] = {
+            "date": str(datetime.date.today()),
+            "timestamp": time.time(),
+            "reply_count": 0,
+            "last_reply_date": str(datetime.date.today()),
+            "status": status
+        }
+        save_db(db)
 
 def extract_target_username(text):
     for line in text.splitlines()[:8]:
@@ -141,6 +157,34 @@ def manual_message_notice(target_user, message_text):
     if not message_text:
         return f"Напишите вручную @{target_user}."
     return f"Напишите вручную @{target_user}: \"{message_text}\""
+
+async def build_pitch_message(target_user, lead_context):
+    pitch_message = await asyncio.to_thread(generate_pitch, lead_context)
+
+    if pitch_message and pitch_message.strip().upper() == "SKIP":
+        logger.info(f"AI decided to SKIP lead {target_user}.")
+        return "SKIP"
+
+    if not pitch_message:
+        logger.warning("Could not generate pitch message. Falling back to default.")
+        pitch_message = (
+            f"Добрый день!\n\n"
+            f"Было бы очень интересно посотрудничать. Развиваю продукт {PRODUCT_NAME}: {PRODUCT_URL}\n\n"
+            f"Он сканирует выбранные вами чаты телеграм нейросетью по заданному описанию и передает вам только целевых лидов прямо в тг и в админку.\n"
+            f"Сейчас мы фокусируемся на развитии платформы, поэтому 10 000 сообщений вы можете получить бесплатно.\n\n"
+            f"Буду рад обсудить детали в переписке!"
+        )
+
+    return pitch_message
+
+async def notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining):
+    await notify_admin(
+        client,
+        f"⏸ Холодные исходящие сообщения на паузе еще {cooldown_remaining // 60} мин. "
+        f"Бот не писал @{target_user}.\n\n"
+        f"{manual_message_notice(target_user, pitch_message)}"
+    )
+    await mark_lead_processed(target_user, "manual_required")
 
 def generate_pitch(lead_context):
     system_prompt = f"""Ты эксперт по B2B продажам. Твоя задача — написать первое сообщение для потенциального клиента (лида) в Telegram.
@@ -281,10 +325,6 @@ async def main():
     @client.on(events.NewMessage(chats=TARGET_CHAT))
     async def handler(event):
         global cooldown_until, pending_leads
-        cooldown_remaining = await get_cooldown_remaining()
-        if cooldown_remaining > 0:
-            return
-            
         text = event.raw_text
         target_user = extract_target_username(text)
         if not target_user:
@@ -314,45 +354,39 @@ async def main():
         
         pitch_message = None
         try:
+            cooldown_remaining = await get_cooldown_remaining()
+            if cooldown_remaining > 0:
+                pitch_message = await build_pitch_message(target_user, lead_context)
+                if pitch_message == "SKIP":
+                    return
+                await notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining)
+                return
+
             delay = random.randint(SEND_DELAY_MIN_SECONDS, SEND_DELAY_MAX_SECONDS)
             logger.info(f"Sleeping for {delay}s before pitching {target_user}...")
             await asyncio.sleep(delay)
             
             cooldown_remaining = await get_cooldown_remaining()
             if cooldown_remaining > 0:
+                pitch_message = await build_pitch_message(target_user, lead_context)
+                if pitch_message == "SKIP":
+                    return
+                await notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining)
                 return
 
-            pitch_message = await asyncio.to_thread(generate_pitch, lead_context)
-            
-            if pitch_message and pitch_message.strip().upper() == "SKIP":
-                logger.info(f"AI decided to SKIP lead {target_user}.")
+            pitch_message = await build_pitch_message(target_user, lead_context)
+            if pitch_message == "SKIP":
                 return
-                
-            if not pitch_message:
-                logger.warning("Could not generate pitch message. Falling back to default.")
-                pitch_message = (
-                    f"Добрый день!\n\n"
-                    f"Было бы очень интересно посотрудничать. Развиваю продукт {PRODUCT_NAME}: {PRODUCT_URL}\n\n"
-                    f"Он сканирует выбранные вами чаты телеграм нейросетью по заданному описанию и передает вам только целевых лидов прямо в тг и в админку.\n"
-                    f"Сейчас мы фокусируемся на развитии платформы, поэтому 10 000 сообщений вы можете получить бесплатно.\n\n"
-                    f"Буду рад обсудить детали в переписке!"
-                )
+
             async with outbound_lock:
                 cooldown_remaining = await get_cooldown_remaining()
                 if cooldown_remaining > 0:
+                    await notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining)
                     return
 
                 await client.send_message(target_user, pitch_message)
             
-            async with db_lock:
-                db = load_db()
-                db["contacted"][target_key] = {
-                    "date": str(datetime.date.today()),
-                    "timestamp": time.time(),
-                    "reply_count": 0,
-                    "last_reply_date": str(datetime.date.today())
-                }
-                save_db(db)
+            await mark_lead_processed(target_user, "sent")
                 
             logger.info(f"Successfully pitched {target_user}")
             await notify_admin(client, f"Отправлен сгенерированный питч новому лиду: @{target_user}\n\nТекст питча:\n{pitch_message}")
@@ -366,6 +400,8 @@ async def main():
                 f"⚠️ Telegram Flood Wait: пауза {cooldown_seconds} секунд при попытке написать @{target_user}.\n\n"
                 f"{manual_message_notice(target_user, pitch_message)}"
             )
+            if pitch_message:
+                await mark_lead_processed(target_user, "manual_required")
         except Exception as e:
             error_text = str(e)
             if "Too many requests" in error_text or "A wait of" in error_text:
@@ -377,6 +413,8 @@ async def main():
                     f"Холодные исходящие сообщения поставлены на паузу на {GENERIC_LIMIT_COOLDOWN_SECONDS // 3600} ч.\n\n"
                     f"{manual_message_notice(target_user, pitch_message)}"
                 )
+                if pitch_message:
+                    await mark_lead_processed(target_user, "manual_required")
             else:
                 logger.error(f"Failed to send pitch to {target_user}: {e}")
                 await notify_admin(
@@ -384,6 +422,8 @@ async def main():
                     f"⚠️ Не удалось отправить питч @{target_user}: {e}\n\n"
                     f"{manual_message_notice(target_user, pitch_message)}"
                 )
+                if pitch_message:
+                    await mark_lead_processed(target_user, "manual_required")
         finally:
             pending_leads.discard(target_key)
 
