@@ -38,6 +38,11 @@ DB_FILE = os.getenv("DB_FILE", "mtproto_leads.json")
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "MaksIgitov")
 PRODUCT_URL = os.getenv("PRODUCT_URL", "https://pulsar-tg.ru/")
 PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Пульсар")
+COLD_DM_DAILY_LIMIT = int(os.getenv("COLD_DM_DAILY_LIMIT", 5))
+SEND_DELAY_MIN_SECONDS = int(os.getenv("SEND_DELAY_MIN_SECONDS", 120))
+SEND_DELAY_MAX_SECONDS = int(os.getenv("SEND_DELAY_MAX_SECONDS", 600))
+GENERIC_LIMIT_COOLDOWN_SECONDS = int(os.getenv("GENERIC_LIMIT_COOLDOWN_SECONDS", 24 * 60 * 60))
+FLOOD_WAIT_EXTRA_SECONDS = int(os.getenv("FLOOD_WAIT_EXTRA_SECONDS", 5 * 60))
 
 llm_client = openai.OpenAI(
     api_key=YANDEX_CLOUD_API_KEY,
@@ -45,6 +50,7 @@ llm_client = openai.OpenAI(
 )
 
 db_lock = asyncio.Lock()
+outbound_lock = asyncio.Lock()
 cooldown_until = 0
 pending_leads = set()
 
@@ -62,7 +68,10 @@ if PROXY_URL:
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r') as f:
-            return json.load(f)
+            db = json.load(f)
+            db.setdefault("contacted", {})
+            db.setdefault("last_reset", str(datetime.date.today()))
+            return db
     return {"contacted": {}, "last_reset": str(datetime.date.today())}
 
 def save_db(db):
@@ -75,17 +84,63 @@ def can_message_today(db):
         db["last_reset"] = today
     
     count_today = sum(1 for v in db["contacted"].values() if v.get("date") == today)
-    return count_today < 25
+    return count_today < COLD_DM_DAILY_LIMIT
 
+def extract_target_username(text):
+    for line in text.splitlines()[:8]:
+        if "👤" not in line:
+            continue
+        username_match = re.search(r'@([a-zA-Z0-9_]{5,32})', line)
+        if username_match:
+            return username_match.group(1)
+    return None
+
+async def get_cooldown_remaining():
+    global cooldown_until
+    now = time.time()
+    async with db_lock:
+        db = load_db()
+        stored_until = float(db.get("cooldown_until", 0) or 0)
+        cooldown_until = max(cooldown_until, stored_until)
+    return max(0, int(cooldown_until - now))
+
+async def activate_cooldown(seconds, reason):
+    global cooldown_until
+    until = time.time() + seconds
+    cooldown_until = max(cooldown_until, until)
+    async with db_lock:
+        db = load_db()
+        db["cooldown_until"] = max(float(db.get("cooldown_until", 0) or 0), cooldown_until)
+        db["cooldown_reason"] = reason
+        save_db(db)
+    logger.warning(f"Outbound Telegram cooldown activated for {seconds}s: {reason}")
 
 
 async def notify_admin(client, message):
     if not BOT_CHAT_ID:
         return
+    if BOT_TOKEN:
+        def send_notification():
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+            payload = {"chat_id": BOT_CHAT_ID, "text": message}
+            requests.post(url, json=payload, proxies=proxies, timeout=10)
+
+        try:
+            await asyncio.to_thread(send_notification)
+            return
+        except Exception as e:
+            logger.error(f"Failed to send admin notification via Bot API: {e}")
+
     try:
         await client.send_message(int(BOT_CHAT_ID), message)
     except Exception as e:
         logger.error(f"Failed to send admin notification via MTProto: {e}")
+
+def manual_message_notice(target_user, message_text):
+    if not message_text:
+        return f"Напишите вручную @{target_user}."
+    return f"Напишите вручную @{target_user}: \"{message_text}\""
 
 def generate_pitch(lead_context):
     system_prompt = f"""Ты эксперт по B2B продажам. Твоя задача — написать первое сообщение для потенциального клиента (лида) в Telegram.
@@ -226,18 +281,16 @@ async def main():
     @client.on(events.NewMessage(chats=TARGET_CHAT))
     async def handler(event):
         global cooldown_until, pending_leads
-        if time.time() < cooldown_until:
+        cooldown_remaining = await get_cooldown_remaining()
+        if cooldown_remaining > 0:
             return
             
         text = event.raw_text
-        username_match = re.search(r'👤.*?\(@([a-zA-Z0-9_]+)\)', text)
-        if not username_match:
-            username_match = re.search(r'@([a-zA-Z0-9_]+)', text)
-            
-        if not username_match:
+        target_user = extract_target_username(text)
+        if not target_user:
+            logger.warning("Could not extract target username from lead header. Skipping lead.")
             return
-            
-        target_user = username_match.group(1)
+
         target_key = str(target_user)
         
         async with db_lock:
@@ -259,12 +312,14 @@ async def main():
             return
         pending_leads.add(target_key)
         
+        pitch_message = None
         try:
-            delay = random.randint(30, 180)
+            delay = random.randint(SEND_DELAY_MIN_SECONDS, SEND_DELAY_MAX_SECONDS)
             logger.info(f"Sleeping for {delay}s before pitching {target_user}...")
             await asyncio.sleep(delay)
             
-            if time.time() < cooldown_until:
+            cooldown_remaining = await get_cooldown_remaining()
+            if cooldown_remaining > 0:
                 return
 
             pitch_message = await asyncio.to_thread(generate_pitch, lead_context)
@@ -282,8 +337,12 @@ async def main():
                     f"Сейчас мы фокусируемся на развитии платформы, поэтому 10 000 сообщений вы можете получить бесплатно.\n\n"
                     f"Буду рад обсудить детали в переписке!"
                 )
-                
-            await client.send_message(target_user, pitch_message)
+            async with outbound_lock:
+                cooldown_remaining = await get_cooldown_remaining()
+                if cooldown_remaining > 0:
+                    return
+
+                await client.send_message(target_user, pitch_message)
             
             async with db_lock:
                 db = load_db()
@@ -300,15 +359,31 @@ async def main():
             
         except errors.FloodWaitError as e:
             logger.error(f"Flood wait error. Must wait {e.seconds} seconds.")
-            cooldown_until = time.time() + e.seconds + 60
-            await notify_admin(client, f"⚠️ Telegram Flood Wait: пауза {e.seconds} секунд.")
+            cooldown_seconds = e.seconds + FLOOD_WAIT_EXTRA_SECONDS
+            await activate_cooldown(cooldown_seconds, f"FloodWait while pitching @{target_user}")
+            await notify_admin(
+                client,
+                f"⚠️ Telegram Flood Wait: пауза {cooldown_seconds} секунд при попытке написать @{target_user}.\n\n"
+                f"{manual_message_notice(target_user, pitch_message)}"
+            )
         except Exception as e:
-            if "Too many requests" in str(e):
-                logger.error(f"Failed to send pitch to {target_user}: Too many requests")
-                cooldown_until = time.time() + 3600
-                await notify_admin(client, f"⚠️ Telegram Limit: Too Many Requests при попытке написать @{target_user}. Пауза 1 час.")
+            error_text = str(e)
+            if "Too many requests" in error_text or "A wait of" in error_text:
+                logger.error(f"Failed to send pitch to {target_user}: {error_text}")
+                await activate_cooldown(GENERIC_LIMIT_COOLDOWN_SECONDS, f"Telegram limit while pitching @{target_user}: {error_text}")
+                await notify_admin(
+                    client,
+                    f"⚠️ Telegram Limit: Too Many Requests при попытке написать @{target_user}. "
+                    f"Холодные исходящие сообщения поставлены на паузу на {GENERIC_LIMIT_COOLDOWN_SECONDS // 3600} ч.\n\n"
+                    f"{manual_message_notice(target_user, pitch_message)}"
+                )
             else:
                 logger.error(f"Failed to send pitch to {target_user}: {e}")
+                await notify_admin(
+                    client,
+                    f"⚠️ Не удалось отправить питч @{target_user}: {e}\n\n"
+                    f"{manual_message_notice(target_user, pitch_message)}"
+                )
         finally:
             pending_leads.discard(target_key)
 
@@ -393,9 +468,18 @@ async def main():
                                     
                         except errors.FloodWaitError as e:
                             logger.error(f"FloodWait when replying: {e.seconds}s")
-                            await notify_admin(client, f"⚠️ Telegram Flood Wait при попытке ответить лиду @{sender_username}. Ожидание {e.seconds}s.")
+                            await notify_admin(
+                                client,
+                                f"⚠️ Telegram Flood Wait при попытке ответить лиду @{sender_username}. Ожидание {e.seconds}s.\n\n"
+                                f"{manual_message_notice(sender_username, reply_text)}"
+                            )
                         except Exception as e:
                             logger.error(f"Error replying to {sender_username}: {e}")
+                            await notify_admin(
+                                client,
+                                f"⚠️ Не удалось автоответить лиду @{sender_username}: {e}\n\n"
+                                f"{manual_message_notice(sender_username, reply_text)}"
+                            )
                     else:
                         logger.info(f"AI decided to ignore reply from {sender_username}.")
                         async with db_lock:
