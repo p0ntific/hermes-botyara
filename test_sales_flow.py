@@ -1,6 +1,4 @@
 import asyncio
-import datetime
-import json
 import os
 import sys
 import tempfile
@@ -31,21 +29,46 @@ if "telethon" not in sys.modules:
 if "telethon.sessions" not in sys.modules:
     sys.modules["telethon.sessions"] = types.SimpleNamespace(StringSession=object)
 
-import tg_lead_skill as bot
+from hermes import sales
+from hermes.config import AccountConfig, Settings
+from hermes.sales import SalesBrain
+from hermes.store import Store
+from hermes.worker import AccountWorker
+
+
+def make_settings(**overrides):
+    values = dict(
+        target_chat=-100123,
+        bot_token="",
+        bot_chat_id="",
+        proxy_url="",
+        manager_username="MaksIgitov",
+        product_url="https://pulsar-tg.ru/",
+        product_name="Пульсар",
+        cold_dm_daily_limit=5,
+        send_delay_min_seconds=0,
+        send_delay_max_seconds=0,
+        generic_limit_cooldown_seconds=18000,
+        flood_wait_extra_seconds=300,
+        incoming_reply_debounce_seconds=0,
+        max_pitch_attempts=5,
+        db_path=":memory:",
+        legacy_json_path="",
+        accounts_file="",
+    )
+    values.update(overrides)
+    return Settings(**values)
 
 
 class SalesFlowDecisionTests(unittest.TestCase):
     def setUp(self):
-        self.original_classifier = bot.classify_conversation_stage
-        self.original_renderer = bot.render_stage_reply
-        bot.render_stage_reply = lambda decision, history: f"reply for {decision['stage']}"
-
-    def tearDown(self):
-        bot.classify_conversation_stage = self.original_classifier
-        bot.render_stage_reply = self.original_renderer
+        self.brain = SalesBrain(router=None, settings=make_settings())
+        self.brain.render_stage_reply = lambda decision, history, lead_key=None: (
+            f"reply for {decision['stage']}"
+        )
 
     def set_stage(self, stage, confidence=0.95, reason="test reason"):
-        bot.classify_conversation_stage = lambda history: {
+        self.brain.classify_conversation_stage = lambda history, lead_key=None: {
             "stage": stage,
             "confidence": confidence,
             "reason": reason,
@@ -53,7 +76,7 @@ class SalesFlowDecisionTests(unittest.TestCase):
 
     def decide_for_message(self, message):
         history = f"Я (менеджер Пульсар): Добрый день\n\nКлиент (@lead123): {message}"
-        return bot.generate_conversational_reply(history)
+        return self.brain.generate_conversational_reply(history)
 
     def test_primary_interest_sends_reply_without_manager(self):
         self.set_stage("primary_interest")
@@ -74,7 +97,7 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertEqual(decision["action"], "handoff_to_manager")
         self.assertEqual(decision["status"], "warm_notified")
         self.assertTrue(decision["notify_manager"])
-        self.assertEqual(decision["reply_text"], bot.handoff_message())
+        self.assertEqual(decision["reply_text"], self.brain.handoff_message())
 
     def test_objection_without_commitment_keeps_dialog(self):
         self.set_stage("objection_without_commitment")
@@ -143,6 +166,25 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertTrue(decision["notify_manager"])
         self.assertEqual(decision["reply_text"], "")
 
+    def test_explicit_negative_short_circuits_llm(self):
+        brain = SalesBrain(router=None, settings=make_settings())
+        history = "Я (менеджер Пульсар): Добрый день\n\nКлиент (@lead123): не интересно, не пишите"
+
+        classification = brain.classify_conversation_stage(history)
+
+        self.assertEqual(classification["stage"], "not_interested")
+        self.assertEqual(classification["confidence"], 1.0)
+
+
+class ExtractionTests(unittest.TestCase):
+    def test_extract_target_username_from_header(self):
+        text = "🔥 Новый лид\n👤 Иван (@ivan_lead)\nостальное"
+        self.assertEqual(sales.extract_target_username(text), "ivan_lead")
+
+    def test_extract_lead_context(self):
+        text = "заголовок\n📄 Оригинал\n\nищу инструмент для лидов"
+        self.assertEqual(sales.extract_lead_context(text), "ищу инструмент для лидов")
+
 
 class FakeAction:
     async def __aenter__(self):
@@ -166,6 +208,9 @@ class FakeClient:
             FakeMessage("Интересно посмотреть, как это может работать?", out=True),
         ]
 
+    def is_connected(self):
+        return True
+
     async def send_read_acknowledge(self, chat_id):
         return None
 
@@ -179,40 +224,46 @@ class FakeClient:
         self.sent_messages.append((chat_id, text))
 
 
-class ProcessPrivateReplySmokeTests(unittest.TestCase):
-    def setUp(self):
-        self.original_db_file = bot.DB_FILE
-        self.original_debounce = bot.INCOMING_REPLY_DEBOUNCE_SECONDS
-        self.original_reply = bot.generate_conversational_reply
-        self.original_notify = bot.notify_admin
-        self.tmp = tempfile.NamedTemporaryFile(delete=False)
-        self.tmp.close()
-        bot.DB_FILE = self.tmp.name
-        bot.INCOMING_REPLY_DEBOUNCE_SECONDS = 0
+class FakeNotifier:
+    def __init__(self):
         self.notifications = []
 
-        today = str(datetime.date.today())
-        with open(bot.DB_FILE, "w") as f:
-            json.dump(
-                {
-                    "contacted": {
-                        "lead123": {
-                            "date": today,
-                            "timestamp": 1,
-                            "reply_count": 0,
-                            "last_reply_date": today,
-                            "status": "sent",
-                        }
-                    },
-                    "last_reset": today,
-                },
-                f,
-            )
+    async def notify(self, message):
+        self.notifications.append(message)
 
-        bot.generate_conversational_reply = lambda history: {
+
+class FakeSender:
+    def __init__(self, id, username):
+        self.id = id
+        self.username = username
+
+
+class FakeEvent:
+    def __init__(self, sender, chat_id=1, text="привет"):
+        self.is_private = True
+        self.chat_id = chat_id
+        self.raw_text = text
+        self._sender = sender
+
+    async def get_sender(self):
+        return self._sender
+
+
+class ProcessPrivateReplySmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        os.unlink(self.tmp.name)
+        self.settings = make_settings(db_path=self.tmp.name)
+        self.store = Store(self.tmp.name)
+        self.store.add_contacted("lead123", "main", "sent")
+
+        self.brain = SalesBrain(router=None, settings=self.settings)
+        handoff = self.brain.handoff_message()
+        self.brain.generate_conversational_reply = lambda history, lead_key=None: {
             "stage": "ready_to_test",
             "action": "handoff_to_manager",
-            "reply_text": bot.handoff_message(),
+            "reply_text": handoff,
             "notify_manager": True,
             "status": "warm_notified",
             "reason": "клиент готов тестировать",
@@ -221,16 +272,14 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
             "action_reason": "клиент готов тестировать",
         }
 
-        async def fake_notify(client, message):
-            self.notifications.append(message)
-
-        bot.notify_admin = fake_notify
+        self.notifier = FakeNotifier()
+        cfg = AccountConfig(name="main", api_id=1, api_hash="x", session="s")
+        self.worker = AccountWorker(cfg, self.settings, self.store, self.brain, self.notifier)
+        self.worker.client = FakeClient()
+        self.worker.healthy = True
 
     def tearDown(self):
-        bot.DB_FILE = self.original_db_file
-        bot.INCOMING_REPLY_DEBOUNCE_SECONDS = self.original_debounce
-        bot.generate_conversational_reply = self.original_reply
-        bot.notify_admin = self.original_notify
+        self.store.close()
         try:
             os.unlink(self.tmp.name)
         except FileNotFoundError:
@@ -238,24 +287,50 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
 
     def test_process_private_reply_marks_warm_and_notifies_once(self):
         async def run_case():
-            client = FakeClient()
-            await bot.process_private_reply(client, 12345, "lead123", "lead123")
-            await bot.process_private_reply(client, 12345, "lead123", "lead123")
-            return client
+            await self.worker.process_private_reply(12345, "lead123", "lead123")
+            await self.worker.process_private_reply(12345, "lead123", "lead123")
 
-        client = asyncio.run(run_case())
+        asyncio.run(run_case())
 
-        with open(bot.DB_FILE) as f:
-            db = json.load(f)
-        lead = db["contacted"]["lead123"]
-
+        lead = self.store.get_lead("lead123")
         self.assertEqual(lead["status"], "warm_notified")
         self.assertEqual(lead["last_stage"], "ready_to_test")
         self.assertEqual(lead["last_action"], "handoff_to_manager")
         self.assertEqual(lead["reply_count"], 999)
         self.assertTrue(lead["manager_notified_at"])
-        self.assertEqual(len(self.notifications), 1)
-        self.assertEqual(len(client.sent_messages), 1)
+        self.assertEqual(len(self.notifier.notifications), 1)
+        self.assertEqual(len(self.worker.client.sent_messages), 1)
+        self.assertIn("Аккаунт: main", self.notifier.notifications[0])
+
+        transcript = self.store.get_transcript("lead123")
+        directions = [t["direction"] for t in transcript]
+        self.assertIn("event", directions)
+        self.assertIn("out", directions)
+
+    def test_pm_handler_ignores_lead_of_another_account(self):
+        self.store.add_contacted("other_lead", "second", "sent")
+
+        async def run_case():
+            await self.worker._pm_handler(FakeEvent(FakeSender(555, "other_lead")))
+            await asyncio.sleep(0)
+
+        asyncio.run(run_case())
+        self.assertEqual(self.worker.pending_reply_tasks, {})
+        self.assertEqual(len(self.worker.client.sent_messages), 0)
+
+    def test_pm_handler_claims_legacy_lead_without_account(self):
+        self.store.add_contacted("legacy_lead", None, "sent")
+
+        async def run_case():
+            await self.worker._pm_handler(FakeEvent(FakeSender(777, "legacy_lead")))
+            task = self.worker.pending_reply_tasks.get("legacy_lead")
+            self.assertIsNotNone(task)
+            await task
+
+        asyncio.run(run_case())
+        lead = self.store.get_lead("legacy_lead")
+        self.assertEqual(lead["account"], "main")
+        self.assertEqual(lead["peer_id"], 777)
 
 
 if __name__ == "__main__":

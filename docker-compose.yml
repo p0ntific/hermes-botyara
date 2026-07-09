@@ -7,5 +7,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      - ./accounts.yaml:/app/accounts.yaml:ro
     environment:
+      - HERMES_DB=/app/data/hermes.db
       - DB_FILE=/app/data/mtproto_leads.json

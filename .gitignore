@@ -5,3 +5,7 @@ mtproto_leads.json
 data/
 *.session
 *.session-journal
+accounts.yaml
+hermes.db
+hermes.db-wal
+hermes.db-shm
