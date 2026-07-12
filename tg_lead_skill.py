@@ -475,18 +475,16 @@ def decide_action(classification):
         "action_reason": reason,
     }
 
-def fallback_reply_for_stage(stage):
-    if stage == "objection_without_commitment":
-        return (
-            f"Риск минимальный: первые 10 000 проверок бесплатные, а настройку чатов и критериев берем на себя. "
-            "Какую нишу или тип клиентов вы бы хотели сначала проверить?"
-        )
-    if stage == "qualification_needed":
-        return "Чтобы прикинуть настройку точнее, кого именно вам важно находить в Telegram-чатах?"
+def search_format_interest_reply():
     return (
-        f"{PRODUCT_NAME} сканирует выбранные Telegram-чаты, отбирает сообщения по вашим критериям и присылает "
-        f"подходящих лидов в Telegram. Подробнее: {PRODUCT_URL} Кого вам было бы полезно искать в первую очередь?"
+        f"{PRODUCT_NAME} сканирует выбранные чаты в телеграм, отбирает сообщения ваших потенциальных клиентов "
+        f"и присылает Вам. Подробнее можете ознакомиться на сайте {PRODUCT_URL}. А сами чаты Вам поможет "
+        f"подобрать Максим (@{MANAGER_USERNAME}), наш менеджер по работе с клиентами. "
+        "Было бы Вам интересно получать клиентов в таком формате?"
     )
+
+def fallback_reply_for_stage(stage):
+    return search_format_interest_reply()
 
 def render_stage_reply(decision, history_text):
     stage = decision["stage"]
@@ -503,9 +501,12 @@ def render_stage_reply(decision, history_text):
 Правила ответа:
 - 1-2 коротких предложения, максимум 350 символов.
 - Без поддержки ради поддержки, без "я вас понимаю", без канцелярита.
-- Если стадия primary_interest или needs_explanation: объясни работу сервиса, дай {PRODUCT_URL}, задай один вопрос.
-- Если qualification_needed: задай один конкретный вопрос о нише/целевых клиентах/чатах.
+- Для primary_interest, needs_explanation и qualification_needed ориентируйся на такой смысл и структуру: "{search_format_interest_reply()}"
+- Если стадия primary_interest или needs_explanation: объясни работу сервиса, дай {PRODUCT_URL}, скажи что чаты и критерии поможет подобрать Максим, спроси только интересен ли такой формат поиска.
+- Если qualification_needed: не уточняй нишу, клиентов, заявки, чаты или критерии. Напиши, что это лучше разобрать с Максимом, и спроси только интересен ли формат поиска.
 - Если objection_without_commitment: сними риск через бесплатный тест и настройку под ключ, но НЕ передавай менеджеру.
+- Не перекладывай на клиента подбор Telegram-чатов, критериев, ниш и заявок до созвона/переписки с Максимом.
+- Единственный вопрос на этапе прогрева: интересен ли клиенту такой формат поиска лидов.
 - Не используй markdown и кавычки вокруг ответа.
 """
     try:
@@ -558,7 +559,17 @@ def build_reply_for_decision(decision, history_text):
 def generate_conversational_reply(history_text):
     classification = classify_conversation_stage(history_text)
     decision = decide_action(classification)
-    return build_reply_for_decision(decision, history_text)
+    decision = build_reply_for_decision(decision, history_text)
+    logger.info(
+        "Conversation decision: stage=%s action=%s status=%s confidence=%.2f reason=%s reply=%s",
+        decision.get("stage"),
+        decision.get("action"),
+        decision.get("status"),
+        clamp_confidence(decision.get("confidence")),
+        decision.get("reason") or decision.get("action_reason") or "",
+        (decision.get("reply_text") or "").replace("\n", " ")[:500],
+    )
+    return decision
 
 def format_history(messages, sender_username):
     history_lines = []
