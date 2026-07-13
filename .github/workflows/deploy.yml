@@ -1,6 +1,7 @@
 name: Deploy Hermes Botyara
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -12,14 +13,103 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
+      - name: Render Runtime Secrets
+        shell: bash
+        env:
+          ACCOUNTS_YAML: ${{ secrets.ACCOUNTS_YAML }}
+          API_ID_PERSONAL: ${{ secrets.API_ID_PERSONAL }}
+          API_HASH_PERSONAL: ${{ secrets.API_HASH_PERSONAL }}
+          SESSION_PERSONAL: ${{ secrets.SESSION_PERSONAL }}
+          TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_CHAT_ID: ${{ secrets.BOT_CHAT_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+          YANDEX_CLOUD_FOLDER: ${{ secrets.YANDEX_CLOUD_FOLDER }}
+          YANDEX_CLOUD_API_KEY: ${{ secrets.YANDEX_CLOUD_API_KEY }}
+          YANDEX_CLOUD_MODEL: ${{ secrets.YANDEX_CLOUD_MODEL }}
+          LLM_FALLBACK_PROVIDER: ${{ secrets.LLM_FALLBACK_PROVIDER }}
+        run: |
+          set -eu
+          umask 077
+          mkdir -p .deploy_runtime
+          : > .deploy_runtime/env.updates
+          : > .deploy_runtime/accounts.yaml
+
+          write_env() {
+            key="$1"
+            value="$2"
+            if [ -n "$value" ]; then
+              printf '%s=%s\n' "$key" "$value" >> .deploy_runtime/env.updates
+            fi
+          }
+
+          write_env ACCOUNTS_FILE accounts.yaml
+          write_env API_ID_PERSONAL "$API_ID_PERSONAL"
+          write_env API_HASH_PERSONAL "$API_HASH_PERSONAL"
+          write_env SESSION_PERSONAL "$SESSION_PERSONAL"
+          write_env TARGET_CHAT "$TARGET_CHAT"
+          write_env BOT_TOKEN "$BOT_TOKEN"
+          write_env BOT_CHAT_ID "$BOT_CHAT_ID"
+          write_env PROXY_URL "$PROXY_URL"
+          write_env LLM_PROVIDER "$LLM_PROVIDER"
+          write_env OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
+          write_env OPENROUTER_MODEL "$OPENROUTER_MODEL"
+          write_env YANDEX_CLOUD_FOLDER "$YANDEX_CLOUD_FOLDER"
+          write_env YANDEX_CLOUD_API_KEY "$YANDEX_CLOUD_API_KEY"
+          write_env YANDEX_CLOUD_MODEL "$YANDEX_CLOUD_MODEL"
+          write_env LLM_FALLBACK_PROVIDER "$LLM_FALLBACK_PROVIDER"
+
+          if [ -n "$ACCOUNTS_YAML" ]; then
+            printf '%s\n' "$ACCOUNTS_YAML" > .deploy_runtime/accounts.yaml
+          fi
+
       - name: Copy Files to Server
         uses: appleboy/scp-action@master
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: "tg_lead_skill.py,hermes,requirements.txt"
+          source: "tg_lead_skill.py,hermes,requirements.txt,.deploy_runtime/env.updates,.deploy_runtime/accounts.yaml"
           target: "~/.hermes/"
+
+      - name: Sync Runtime Secrets
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -eu
+            cd ~/.hermes
+            touch .env
+            chmod 600 .env
+
+            merge_env() {
+              key="$1"
+              value="$2"
+              tmp="$(mktemp)"
+              grep -v "^${key}=" .env > "$tmp" || true
+              printf '%s=%s\n' "$key" "$value" >> "$tmp"
+              cat "$tmp" > .env
+              rm -f "$tmp"
+            }
+
+            if [ -s .deploy_runtime/env.updates ]; then
+              while IFS='=' read -r key value; do
+                [ -n "$key" ] || continue
+                merge_env "$key" "$value"
+              done < .deploy_runtime/env.updates
+            fi
+
+            if [ -s .deploy_runtime/accounts.yaml ]; then
+              mv .deploy_runtime/accounts.yaml accounts.yaml
+              chmod 600 accounts.yaml
+            fi
+
+            rm -rf .deploy_runtime
 
       - name: Restart Service
         uses: appleboy/ssh-action@v1.0.3
