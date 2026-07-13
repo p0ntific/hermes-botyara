@@ -159,9 +159,10 @@ class SalesBrain:
 
     # --- pitch ---------------------------------------------------------
 
-    def handoff_message(self):
+    def handoff_message(self, manager_username=None):
+        manager_username = manager_username or self.settings.manager_username
         return (
-            f"Отлично, тогда подключу Максима @{self.settings.manager_username}: он поможет подобрать чаты "
+            f"Отлично, тогда подключу @{manager_username}: он поможет подобрать чаты "
             "и критерии, чтобы тест был полезным. Он свяжется с вами в переписке или поможет "
             "на коротком созвоне."
         )
@@ -258,16 +259,18 @@ class SalesBrain:
             "model": f"{result.provider}:{result.model}",
         }
 
-    def fallback_reply_for_stage(self, stage):
+    def fallback_reply_for_stage(self, stage, manager_username=None):
+        manager_username = manager_username or self.settings.manager_username
         return (
             f"{self.settings.product_name} сканирует выбранные чаты в телеграм, отбирает сообщения ваших потенциальных клиентов "
             f"и присылает Вам. Подробнее можете ознакомиться на сайте {self.settings.product_url}. А сами чаты Вам поможет "
-            f"подобрать Максим (@{self.settings.manager_username}), наш менеджер по работе с клиентами. "
+            f"подобрать @{manager_username}, наш менеджер по работе с клиентами. "
             "Было бы Вам интересно получать клиентов в таком формате?"
         )
 
-    def render_stage_reply(self, decision, history_text, lead_key=None):
+    def render_stage_reply(self, decision, history_text, lead_key=None, manager_username=None):
         stage = decision["stage"]
+        manager_username = manager_username or self.settings.manager_username
         try:
             result = self.router.chat(
                 "reply",
@@ -278,7 +281,7 @@ class SalesBrain:
                             self.settings.product_name,
                             self.settings.product_url,
                             stage,
-                            self.settings.manager_username,
+                            manager_username,
                         ),
                     },
                     {"role": "user", "content": f"ИСТОРИЯ ДИАЛОГА:\n{history_text}"},
@@ -289,11 +292,11 @@ class SalesBrain:
             )
         except LLMUnavailable as e:
             logger.error(f"Failed to render stage reply: {e}")
-            return self.fallback_reply_for_stage(stage)
+            return self.fallback_reply_for_stage(stage, manager_username=manager_username)
 
         output = result.text
         if not output:
-            return self.fallback_reply_for_stage(stage)
+            return self.fallback_reply_for_stage(stage, manager_username=manager_username)
         if "</think>" in output:
             output = output.split("</think>")[-1].strip()
         output = re.sub(r"^```[a-zA-Z]*\s*", "", output)
@@ -302,17 +305,23 @@ class SalesBrain:
         output = sanitize_outgoing(output)
         if len(output) > 600:
             logger.warning(f"Generated stage reply is too long ({len(output)} chars). Using fallback.")
-            return self.fallback_reply_for_stage(stage)
-        return output or self.fallback_reply_for_stage(stage)
+            return self.fallback_reply_for_stage(stage, manager_username=manager_username)
+        return output or self.fallback_reply_for_stage(stage, manager_username=manager_username)
 
-    def build_reply_for_decision(self, decision, history_text, lead_key=None):
+    def build_reply_for_decision(self, decision, history_text, lead_key=None, manager_username=None):
+        manager_username = manager_username or self.settings.manager_username
         action = decision.get("action")
         if action == "handoff_to_manager":
-            decision["reply_text"] = self.handoff_message()
+            decision["reply_text"] = self.handoff_message(manager_username=manager_username)
         elif action in {"silent_stop", "manual_review"}:
             decision["reply_text"] = ""
         elif action == "send_reply":
-            decision["reply_text"] = self.render_stage_reply(decision, history_text, lead_key=lead_key)
+            decision["reply_text"] = self.render_stage_reply(
+                decision,
+                history_text,
+                lead_key=lead_key,
+                manager_username=manager_username,
+            )
         else:
             decision["action"] = "manual_review"
             decision["status"] = "manual_review"
@@ -324,12 +333,17 @@ class SalesBrain:
             decision["reply_text"] = sanitize_outgoing(decision["reply_text"])
         return decision
 
-    def generate_conversational_reply(self, history_text, lead_key=None):
+    def generate_conversational_reply(self, history_text, lead_key=None, manager_username=None):
         classification = self.classify_conversation_stage(history_text, lead_key=lead_key)
         decision = decide_action(classification)
         if classification.get("model"):
             decision["model"] = classification["model"]
-        return self.build_reply_for_decision(decision, history_text, lead_key=lead_key)
+        return self.build_reply_for_decision(
+            decision,
+            history_text,
+            lead_key=lead_key,
+            manager_username=manager_username,
+        )
 
 
 def manual_message_notice(target_user, message_text):

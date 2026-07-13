@@ -75,6 +75,10 @@ def _today():
     return str(datetime.date.today())
 
 
+def _lead_key(value):
+    return str(value).strip().lower()
+
+
 class Store:
     """SQLite-backed state: durable lead queue, dialog transcripts, per-account state.
 
@@ -120,6 +124,7 @@ class Store:
 
             contacted = legacy.get("contacted") or {}
             for lead_key, data in contacted.items():
+                lead_key = _lead_key(lead_key)
                 self._conn.execute(
                     """INSERT OR IGNORE INTO leads
                        (lead_key, account, status, date, timestamp, reply_count,
@@ -156,21 +161,25 @@ class Store:
     # --- leads -----------------------------------------------------------
 
     def get_lead(self, lead_key):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM leads WHERE lead_key=?", (str(lead_key),)
+                "SELECT * FROM leads WHERE lead_key=?", (lead_key,)
             ).fetchone()
             return dict(row) if row else None
 
     def find_lead(self, username, peer_id):
+        username = _lead_key(username or "")
+        peer_key = _lead_key(peer_id or "")
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM leads WHERE lead_key=? OR lead_key=? OR peer_id=? LIMIT 1",
-                (str(username or ""), str(peer_id or ""), peer_id),
+                (username, peer_key, peer_id),
             ).fetchone()
             return dict(row) if row else None
 
     def add_contacted(self, lead_key, account, status):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
                 """INSERT INTO leads (lead_key, account, status, date, timestamp, reply_count, last_reply_date)
@@ -182,34 +191,46 @@ class Store:
             )
             self._conn.commit()
 
+    def remove_lead_if_status(self, lead_key, account, status):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM leads WHERE lead_key=? AND account=? AND status=?",
+                (lead_key, account, status),
+            )
+            self._conn.commit()
+
     def claim_lead_account(self, lead_key, account):
         """Bind a legacy (pre-multi-account) lead to the account that got the reply."""
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
                 "UPDATE leads SET account=? WHERE lead_key=? AND account IS NULL",
-                (account, str(lead_key)),
+                (account, lead_key),
             )
             self._conn.commit()
 
     def set_lead_peer(self, lead_key, peer_id):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
-                "UPDATE leads SET peer_id=? WHERE lead_key=?", (peer_id, str(lead_key))
+                "UPDATE leads SET peer_id=? WHERE lead_key=?", (peer_id, lead_key)
             )
             self._conn.commit()
 
     def reset_reply_count_if_new_day(self, lead_key):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             row = self._conn.execute(
                 "SELECT reply_count, last_reply_date FROM leads WHERE lead_key=?",
-                (str(lead_key),),
+                (lead_key,),
             ).fetchone()
             if row is None:
                 return 0
             if row["last_reply_date"] != _today():
                 self._conn.execute(
                     "UPDATE leads SET last_reply_date=?, reply_count=0 WHERE lead_key=?",
-                    (_today(), str(lead_key)),
+                    (_today(), lead_key),
                 )
                 self._conn.commit()
                 return 0
@@ -217,12 +238,13 @@ class Store:
 
     def apply_decision(self, lead_key, decision, replied):
         """Mirror of the legacy post-reply bookkeeping."""
+        lead_key = _lead_key(lead_key)
         action = decision.get("action")
         status = decision.get("status")
         with self._lock:
             row = self._conn.execute(
                 "SELECT reply_count, manager_notified_at FROM leads WHERE lead_key=?",
-                (str(lead_key),),
+                (lead_key,),
             ).fetchone()
             if row is None:
                 return False
@@ -245,17 +267,18 @@ class Store:
                     reply_count,
                     status,
                     stop_reason,
-                    str(lead_key),
+                    lead_key,
                 ),
             )
             self._conn.commit()
             return bool(row["manager_notified_at"])
 
     def mark_manager_notified(self, lead_key, status=None):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
                 "UPDATE leads SET manager_notified_at=?, status=COALESCE(?, status) WHERE lead_key=?",
-                (time.time(), status, str(lead_key)),
+                (time.time(), status, lead_key),
             )
             self._conn.commit()
 
@@ -273,7 +296,7 @@ class Store:
 
     def enqueue_lead(self, lead_key, context):
         """Idempotent enqueue; returns True only for a brand-new lead."""
-        lead_key = str(lead_key)
+        lead_key = _lead_key(lead_key)
         with self._lock:
             exists = self._conn.execute(
                 "SELECT 1 FROM leads WHERE lead_key=?", (lead_key,)
@@ -313,19 +336,21 @@ class Store:
             return claimed
 
     def release_lead(self, lead_key, error=None):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
                 """UPDATE queue SET status='pending', assigned_account=NULL,
                        last_error=?, updated_at=? WHERE lead_key=?""",
-                (error, time.time(), str(lead_key)),
+                (error, time.time(), lead_key),
             )
             self._conn.commit()
 
     def finish_queue(self, lead_key, status, error=None):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
                 "UPDATE queue SET status=?, last_error=?, updated_at=? WHERE lead_key=?",
-                (status, error, time.time(), str(lead_key)),
+                (status, error, time.time(), lead_key),
             )
             self._conn.commit()
 
@@ -348,9 +373,10 @@ class Store:
             return int(row["c"])
 
     def get_queue_attempts(self, lead_key):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             row = self._conn.execute(
-                "SELECT attempts FROM queue WHERE lead_key=?", (str(lead_key),)
+                "SELECT attempts FROM queue WHERE lead_key=?", (lead_key,)
             ).fetchone()
             return int(row["attempts"]) if row else 0
 
@@ -414,11 +440,12 @@ class Store:
     # --- transparency ------------------------------------------------------
 
     def record_message(self, lead_key, account, direction, text, meta=None):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             self._conn.execute(
                 "INSERT INTO transcripts (lead_key, account, direction, text, meta, created_at) VALUES (?,?,?,?,?,?)",
                 (
-                    str(lead_key),
+                    lead_key,
                     account,
                     direction,
                     text,
@@ -451,10 +478,11 @@ class Store:
             return [dict(r) for r in rows]
 
     def get_transcript(self, lead_key, limit=200):
+        lead_key = _lead_key(lead_key)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM transcripts WHERE lead_key=? ORDER BY created_at LIMIT ?",
-                (str(lead_key), limit),
+                (lead_key, limit),
             ).fetchall()
             return [dict(r) for r in rows]
 

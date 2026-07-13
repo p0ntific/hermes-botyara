@@ -63,7 +63,7 @@ def make_settings(**overrides):
 class SalesFlowDecisionTests(unittest.TestCase):
     def setUp(self):
         self.brain = SalesBrain(router=None, settings=make_settings())
-        self.brain.render_stage_reply = lambda decision, history, lead_key=None: (
+        self.brain.render_stage_reply = lambda decision, history, lead_key=None, manager_username=None: (
             f"reply for {decision['stage']}"
         )
 
@@ -98,6 +98,18 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertEqual(decision["status"], "warm_notified")
         self.assertTrue(decision["notify_manager"])
         self.assertEqual(decision["reply_text"], self.brain.handoff_message())
+
+    def test_handoff_can_target_account_specific_manager(self):
+        self.set_stage("ready_to_test")
+        history = "Я (менеджер Пульсар): Добрый день\n\nКлиент (@lead123): готов тестировать"
+
+        decision = self.brain.generate_conversational_reply(
+            history,
+            manager_username="andrew_pontific",
+        )
+
+        self.assertIn("@andrew_pontific", decision["reply_text"])
+        self.assertNotIn("@MaksIgitov", decision["reply_text"])
 
     def test_objection_without_commitment_keeps_dialog(self):
         self.set_stage("objection_without_commitment")
@@ -181,11 +193,20 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertIn("сканирует выбранные чаты в телеграм", reply)
         self.assertIn("сообщения ваших потенциальных клиентов", reply)
         self.assertIn("https://pulsar-tg.ru/", reply)
-        self.assertIn("Максим (@MaksIgitov)", reply)
+        self.assertIn("@MaksIgitov", reply)
         self.assertIn("Было бы Вам интересно получать клиентов в таком формате?", reply)
         self.assertNotIn("каких клиентов", reply)
         self.assertNotIn("какие запросы", reply)
         self.assertNotIn("каких чатах", reply)
+
+    def test_fallback_can_target_account_specific_manager(self):
+        reply = self.brain.fallback_reply_for_stage(
+            "primary_interest",
+            manager_username="andrew_pontific",
+        )
+
+        self.assertIn("@andrew_pontific", reply)
+        self.assertNotIn("@MaksIgitov", reply)
 
 
 class ExtractionTests(unittest.TestCase):
@@ -272,7 +293,7 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
 
         self.brain = SalesBrain(router=None, settings=self.settings)
         handoff = self.brain.handoff_message()
-        self.brain.generate_conversational_reply = lambda history, lead_key=None: {
+        self.brain.generate_conversational_reply = lambda history, lead_key=None, manager_username=None: {
             "stage": "ready_to_test",
             "action": "handoff_to_manager",
             "reply_text": handoff,

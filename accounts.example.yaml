@@ -7,6 +7,7 @@ accounts:
     api_hash: ${API_HASH}
     session: ${SESSION}
     # proxy: socks5h://127.0.0.1:9051   # опционально, свой прокси на аккаунт
+    # manager_username: andrew_pontific  # кого упоминать при handoff с этого аккаунта
     # cold_dm_daily_limit: 5            # опционально, лимит холодных DM в день
     # enabled: false                    # временно выключить аккаунт
 
@@ -15,3 +16,4 @@ accounts:
   #   api_hash: ${API_HASH_SECOND}
   #   session: ${SESSION_SECOND}
   #   proxy: socks5h://127.0.0.1:9052
+  #   manager_username: MaksIgitov

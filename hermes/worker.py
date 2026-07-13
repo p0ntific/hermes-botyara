@@ -120,6 +120,11 @@ class AccountWorker:
         target_user = queue_item["lead_key"]
         lead_context = queue_item.get("context") or ""
 
+        if self.store.get_lead(target_user):
+            logger.info(f"[{self.name}] lead @{target_user} already contacted, finishing duplicate queue item")
+            self.store.finish_queue(target_user, "duplicate")
+            return "duplicate"
+
         async with self.pitch_lock:
             pitch_message = await asyncio.to_thread(
                 self.brain.build_pitch_message, target_user, lead_context
@@ -145,8 +150,12 @@ class AccountWorker:
                 raise PitchRetryable(f"cooldown active on {self.name}")
 
             try:
+                # Persist before the network send so a crash after Telegram accepts
+                # the message cannot cause another account to cold-pitch this lead.
+                self.store.add_contacted(target_user, self.name, "pitching")
                 await self.client.send_message(target_user, pitch_message)
             except errors.FloodWaitError as e:
+                self.store.remove_lead_if_status(target_user, self.name, "pitching")
                 logger.error(f"[{self.name}] flood wait error. Must wait {e.seconds} seconds.")
                 self.store.activate_cooldown(
                     self.name,
@@ -157,6 +166,7 @@ class AccountWorker:
             except Exception as e:
                 error_text = str(e)
                 if "Too many requests" in error_text or "A wait of" in error_text:
+                    self.store.remove_lead_if_status(target_user, self.name, "pitching")
                     logger.error(f"[{self.name}] failed to send pitch to @{target_user}: {error_text}")
                     self.store.activate_cooldown(
                         self.name,
@@ -253,7 +263,10 @@ class AccountWorker:
 
             async with self.client.action(chat_id, "typing"):
                 ai_response = await asyncio.to_thread(
-                    self.brain.generate_conversational_reply, history_text, target_key
+                    self.brain.generate_conversational_reply,
+                    history_text,
+                    target_key,
+                    self.cfg.manager_username,
                 )
 
             if ai_response is None or "reply_text" not in ai_response:

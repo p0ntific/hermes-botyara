@@ -44,6 +44,7 @@ class AccountConfig:
     api_hash: str
     session: str
     proxy_url: str = ""
+    manager_username: str = ""
     cold_dm_daily_limit: int = 5
     enabled: bool = True
 
@@ -131,6 +132,7 @@ def load_accounts(settings):
             api_hash=api_hash,
             session=session,
             proxy_url=settings.proxy_url,
+            manager_username=settings.manager_username,
             cold_dm_daily_limit=settings.cold_dm_daily_limit,
         )
     ]
@@ -159,6 +161,7 @@ def _load_accounts_yaml(path, settings):
                 api_hash=str(raw["api_hash"]),
                 session=str(raw["session"]),
                 proxy_url=str(raw.get("proxy") or ""),
+                manager_username=str(raw.get("manager_username") or settings.manager_username),
                 cold_dm_daily_limit=int(raw.get("cold_dm_daily_limit") or settings.cold_dm_daily_limit),
             )
         except (KeyError, TypeError, ValueError) as e:

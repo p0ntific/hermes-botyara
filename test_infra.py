@@ -34,6 +34,7 @@ from hermes import config
 from hermes.dispatcher import Dispatcher
 from hermes.llm import LLMRouter, LLMUnavailable
 from hermes.store import Store
+from hermes.worker import AccountWorker
 from test_sales_flow import make_settings
 
 
@@ -57,6 +58,7 @@ accounts:
     api_id: 111
     api_hash: hash-a
     session: ${TEST_SESSION_MAIN}
+    manager_username: andrew_pontific
     cold_dm_daily_limit: 3
   - name: second
     api_id: 222
@@ -80,7 +82,9 @@ accounts:
 
         self.assertEqual([a.name for a in accounts], ["main", "second"])
         self.assertEqual(accounts[0].session, "secret-session")
+        self.assertEqual(accounts[0].manager_username, "andrew_pontific")
         self.assertEqual(accounts[0].cold_dm_daily_limit, 3)
+        self.assertEqual(accounts[1].manager_username, settings.manager_username)
         self.assertEqual(accounts[1].proxy, {"proxy_type": "socks5", "addr": "127.0.0.1", "port": 9052})
 
     def test_legacy_env_fallback(self):
@@ -265,6 +269,14 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         self.assertFalse(store.enqueue_lead("user1", "ctx"))
         self.assertEqual(store.pending_count(), 1)
 
+    def test_enqueue_normalizes_username_case(self):
+        store = self.make_store()
+        self.assertTrue(store.enqueue_lead("Lead_User", "ctx"))
+        self.assertFalse(store.enqueue_lead("lead_user", "ctx"))
+        self.assertEqual(store.pending_count(), 1)
+        claimed = store.claim_next_pending("main", max_attempts=3)
+        self.assertEqual(claimed["lead_key"], "lead_user")
+
     def test_enqueue_skips_already_contacted(self):
         store = self.make_store()
         store.add_contacted("user1", "main", "sent")
@@ -289,6 +301,27 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         exhausted = store.claim_next_pending("main", max_attempts=2)
         self.assertEqual(exhausted["status"], "failed")
         self.assertEqual(store.pending_count(), 0)
+
+    def test_concurrent_claim_only_assigns_one_account(self):
+        store = self.make_store()
+        store.enqueue_lead("user1", "ctx")
+
+        results = []
+
+        def claim(account):
+            results.append(store.claim_next_pending(account, max_attempts=3))
+
+        import threading
+
+        threads = [threading.Thread(target=claim, args=(name,)) for name in ("main", "second")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        claimed = [item for item in results if item is not None]
+        self.assertEqual(len(claimed), 1)
+        self.assertIn(claimed[0]["assigned_account"], {"main", "second"})
 
     def test_requeue_stuck_after_crash(self):
         store = self.make_store()
@@ -354,6 +387,38 @@ class _StubWorker:
     async def process_lead(self, item):
         self.processed.append(item["lead_key"])
         return "sent"
+
+
+class _FakeBrain:
+    def build_pitch_message(self, target_user, lead_context):
+        return "pitch"
+
+
+class _FakeClient:
+    def __init__(self):
+        self.sent_messages = []
+
+    async def send_message(self, target_user, text):
+        self.sent_messages.append((target_user, text))
+
+
+class _FakeNotifier:
+    async def notify(self, message):
+        pass
+
+
+class AccountWorkerQueueTests(TempStoreMixin, unittest.TestCase):
+    def test_process_lead_skips_existing_lead_without_sending(self):
+        store = self.make_store()
+        store.add_contacted("lead_x", "other", "sent")
+        cfg = config.AccountConfig(name="main", api_id=1, api_hash="hash", session="session")
+        worker = AccountWorker(cfg, make_settings(), store, _FakeBrain(), _FakeNotifier())
+        worker.client = _FakeClient()
+
+        result = asyncio.run(worker.process_lead({"lead_key": "lead_x", "context": "ctx"}))
+
+        self.assertEqual(result, "duplicate")
+        self.assertEqual(worker.client.sent_messages, [])
 
 
 class DispatcherTests(TempStoreMixin, unittest.TestCase):
