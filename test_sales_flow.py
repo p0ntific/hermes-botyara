@@ -175,6 +175,18 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertEqual(classification["stage"], "not_interested")
         self.assertEqual(classification["confidence"], 1.0)
 
+    def test_fallback_followup_asks_only_about_search_format(self):
+        reply = self.brain.fallback_reply_for_stage("primary_interest")
+
+        self.assertIn("сканирует выбранные чаты в телеграм", reply)
+        self.assertIn("сообщения ваших потенциальных клиентов", reply)
+        self.assertIn("https://pulsar-tg.ru/", reply)
+        self.assertIn("Максим (@MaksIgitov)", reply)
+        self.assertIn("Было бы Вам интересно получать клиентов в таком формате?", reply)
+        self.assertNotIn("каких клиентов", reply)
+        self.assertNotIn("какие запросы", reply)
+        self.assertNotIn("каких чатах", reply)
+
 
 class ExtractionTests(unittest.TestCase):
     def test_extract_target_username_from_header(self):

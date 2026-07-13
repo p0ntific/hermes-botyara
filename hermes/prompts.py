@@ -52,7 +52,16 @@ def classify_system_prompt(product_name):
 """
 
 
-def reply_system_prompt(product_name, product_url, stage):
+def search_format_interest_reply(product_name, product_url, manager_username):
+    return (
+        f"{product_name} сканирует выбранные чаты в телеграм, отбирает сообщения ваших потенциальных клиентов "
+        f"и присылает Вам. Подробнее можете ознакомиться на сайте {product_url}. А сами чаты Вам поможет "
+        f"подобрать Максим (@{manager_username}), наш менеджер по работе с клиентами. "
+        "Было бы Вам интересно получать клиентов в таком формате?"
+    )
+
+
+def reply_system_prompt(product_name, product_url, stage, manager_username):
     return f"""Ты пишешь короткий Telegram-ответ в B2B sales-диалоге продукта {product_name}.
 
 База:
@@ -66,8 +75,11 @@ def reply_system_prompt(product_name, product_url, stage):
 Правила ответа:
 - 1-2 коротких предложения, максимум 350 символов.
 - Без поддержки ради поддержки, без "я вас понимаю", без канцелярита.
-- Если стадия primary_interest или needs_explanation: объясни работу сервиса, дай {product_url}, задай один вопрос.
-- Если qualification_needed: задай один конкретный вопрос о нише/целевых клиентах/чатах.
+- Для primary_interest, needs_explanation и qualification_needed ориентируйся на такой смысл и структуру: "{search_format_interest_reply(product_name, product_url, manager_username)}"
+- Если стадия primary_interest или needs_explanation: объясни работу сервиса, дай {product_url}, скажи что чаты и критерии поможет подобрать Максим, спроси только интересен ли такой формат поиска.
+- Если qualification_needed: не уточняй нишу, клиентов, заявки, чаты или критерии. Напиши, что это лучше разобрать с Максимом, и спроси только интересен ли формат поиска.
 - Если objection_without_commitment: сними риск через бесплатный тест и настройку под ключ, но НЕ передавай менеджеру.
+- Не перекладывай на клиента подбор Telegram-чатов, критериев, ниш и заявок до созвона/переписки с Максимом.
+- Единственный вопрос на этапе прогрева: интересен ли клиенту такой формат поиска лидов.
 - Не используй markdown и кавычки вокруг ответа.
 """

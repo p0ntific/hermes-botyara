@@ -259,16 +259,11 @@ class SalesBrain:
         }
 
     def fallback_reply_for_stage(self, stage):
-        if stage == "objection_without_commitment":
-            return (
-                "Риск минимальный: первые 10 000 проверок бесплатные, а настройку чатов и критериев берем на себя. "
-                "Какую нишу или тип клиентов вы бы хотели сначала проверить?"
-            )
-        if stage == "qualification_needed":
-            return "Чтобы прикинуть настройку точнее, кого именно вам важно находить в Telegram-чатах?"
         return (
-            f"{self.settings.product_name} сканирует выбранные Telegram-чаты, отбирает сообщения по вашим критериям и присылает "
-            f"подходящих лидов в Telegram. Подробнее: {self.settings.product_url} Кого вам было бы полезно искать в первую очередь?"
+            f"{self.settings.product_name} сканирует выбранные чаты в телеграм, отбирает сообщения ваших потенциальных клиентов "
+            f"и присылает Вам. Подробнее можете ознакомиться на сайте {self.settings.product_url}. А сами чаты Вам поможет "
+            f"подобрать Максим (@{self.settings.manager_username}), наш менеджер по работе с клиентами. "
+            "Было бы Вам интересно получать клиентов в таком формате?"
         )
 
     def render_stage_reply(self, decision, history_text, lead_key=None):
@@ -280,7 +275,10 @@ class SalesBrain:
                     {
                         "role": "system",
                         "content": prompts.reply_system_prompt(
-                            self.settings.product_name, self.settings.product_url, stage
+                            self.settings.product_name,
+                            self.settings.product_url,
+                            stage,
+                            self.settings.manager_username,
                         ),
                     },
                     {"role": "user", "content": f"ИСТОРИЯ ДИАЛОГА:\n{history_text}"},
