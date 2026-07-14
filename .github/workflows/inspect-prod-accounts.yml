@@ -26,7 +26,7 @@ jobs:
             from hermes.config import load_settings, load_accounts
 
             async def main():
-                load_dotenv()
+                load_dotenv(".env")
                 settings = load_settings()
                 try:
                     accounts = load_accounts(settings)
