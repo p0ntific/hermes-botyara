@@ -34,15 +34,15 @@ jobs:
         run: |
           set -eu
           umask 077
-          mkdir -p .deploy_runtime
-          : > .deploy_runtime/env.updates
-          : > .deploy_runtime/accounts.yaml
+          mkdir -p deploy_runtime
+          : > deploy_runtime/env.updates
+          : > deploy_runtime/accounts.yaml
 
           write_env() {
             key="$1"
             value="$2"
             if [ -n "$value" ]; then
-              printf '%s=%s\n' "$key" "$value" >> .deploy_runtime/env.updates
+              printf '%s=%s\n' "$key" "$value" >> deploy_runtime/env.updates
             fi
           }
 
@@ -63,7 +63,7 @@ jobs:
           write_env LLM_FALLBACK_PROVIDER "$LLM_FALLBACK_PROVIDER"
 
           if [ -n "$ACCOUNTS_YAML" ]; then
-            printf '%s\n' "$ACCOUNTS_YAML" > .deploy_runtime/accounts.yaml
+            printf '%s\n' "$ACCOUNTS_YAML" > deploy_runtime/accounts.yaml
           fi
 
       - name: Copy Files to Server
@@ -72,7 +72,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: "tg_lead_skill.py,hermes,requirements.txt,.deploy_runtime/env.updates,.deploy_runtime/accounts.yaml"
+          source: "tg_lead_skill.py,hermes,requirements.txt,deploy_runtime/env.updates,deploy_runtime/accounts.yaml"
           target: "~/.hermes/"
 
       - name: Sync Runtime Secrets
@@ -97,19 +97,22 @@ jobs:
               rm -f "$tmp"
             }
 
-            if [ -s .deploy_runtime/env.updates ]; then
+            if [ -s deploy_runtime/env.updates ]; then
               while IFS='=' read -r key value; do
                 [ -n "$key" ] || continue
                 merge_env "$key" "$value"
-              done < .deploy_runtime/env.updates
+              done < deploy_runtime/env.updates
+            else
+              echo "Missing runtime env updates" >&2
+              exit 1
             fi
 
-            if [ -s .deploy_runtime/accounts.yaml ]; then
-              mv .deploy_runtime/accounts.yaml accounts.yaml
+            if [ -s deploy_runtime/accounts.yaml ]; then
+              mv deploy_runtime/accounts.yaml accounts.yaml
               chmod 600 accounts.yaml
             fi
 
-            rm -rf .deploy_runtime
+            rm -rf deploy_runtime
 
       - name: Restart Service
         uses: appleboy/ssh-action@v1.0.3
