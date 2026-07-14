@@ -28,7 +28,25 @@ jobs:
             async def main():
                 load_dotenv()
                 settings = load_settings()
-                accounts = load_accounts(settings)
+                try:
+                    accounts = load_accounts(settings)
+                except Exception as e:
+                    print(f"load_accounts_error={type(e).__name__}: {e}")
+                    print(
+                        "env_presence="
+                        + ",".join(
+                            f"{key}:{bool(__import__('os').getenv(key))}"
+                            for key in (
+                                "API_ID",
+                                "API_HASH",
+                                "SESSION",
+                                "API_ID_PERSONAL",
+                                "API_HASH_PERSONAL",
+                                "SESSION_PERSONAL",
+                            )
+                        )
+                    )
+                    return
                 print(f"accounts_found={len(accounts)}")
                 for account in accounts:
                     client = TelegramClient(
