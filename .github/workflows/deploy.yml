@@ -63,6 +63,12 @@ jobs:
               rm -f "$tmp"
             }
 
+            has_env_value() {
+              key="$1"
+              value="$(grep -m 1 "^${key}=" .env | cut -d= -f2- || true)"
+              [ -n "$value" ]
+            }
+
             merge_env ACCOUNTS_FILE accounts.yaml
             for key in \
               API_ID API_HASH SESSION \
@@ -81,7 +87,7 @@ jobs:
             : > accounts.yaml
             printf 'accounts:\n' >> accounts.yaml
 
-            if [ -n "${API_ID:-}" ] && [ -n "${API_HASH:-}" ] && [ -n "${SESSION:-}" ]; then
+            if has_env_value API_ID && has_env_value API_HASH && has_env_value SESSION; then
               printf '  - name: main\n' >> accounts.yaml
               printf '    api_id: ${API_ID}\n' >> accounts.yaml
               printf '    api_hash: ${API_HASH}\n' >> accounts.yaml
@@ -89,7 +95,7 @@ jobs:
               printf '    manager_username: andrew_pontific\n' >> accounts.yaml
             fi
 
-            if [ -n "${API_ID_PERSONAL:-}" ] && [ -n "${API_HASH_PERSONAL:-}" ] && [ -n "${SESSION_PERSONAL:-}" ]; then
+            if has_env_value API_ID_PERSONAL && has_env_value API_HASH_PERSONAL && has_env_value SESSION_PERSONAL; then
               printf '  - name: personal\n' >> accounts.yaml
               printf '    api_id: ${API_ID_PERSONAL}\n' >> accounts.yaml
               printf '    api_hash: ${API_HASH_PERSONAL}\n' >> accounts.yaml
@@ -104,6 +110,8 @@ jobs:
             fi
 
             chmod 600 accounts.yaml
+            echo "Configured account names:"
+            grep 'name:' accounts.yaml | sed 's/^ *- name: /- /'
 
       - name: Restart Service
         uses: appleboy/ssh-action@v1.0.3
