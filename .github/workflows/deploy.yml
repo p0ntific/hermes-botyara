@@ -92,7 +92,7 @@ jobs:
               printf '    api_id: ${API_ID}\n' >> accounts.yaml
               printf '    api_hash: ${API_HASH}\n' >> accounts.yaml
               printf '    session: ${SESSION}\n' >> accounts.yaml
-              printf '    manager_username: maksim_igitov\n' >> accounts.yaml
+              printf '    manager_username: MaksIgitov\n' >> accounts.yaml
             fi
 
             if has_env_value API_ID_PERSONAL && has_env_value API_HASH_PERSONAL && has_env_value SESSION_PERSONAL; then
