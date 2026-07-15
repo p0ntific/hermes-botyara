@@ -99,6 +99,17 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertTrue(decision["notify_manager"])
         self.assertEqual(decision["reply_text"], self.brain.handoff_message())
 
+    def test_ready_to_test_with_client_question_answers_before_handoff(self):
+        self.set_stage("ready_to_test")
+
+        decision = self.decide_for_message("Да давайте. 10 000 сообщений бесплатно, я правильно понял?")
+
+        self.assertEqual(decision["stage"], "needs_explanation")
+        self.assertEqual(decision["action"], "send_reply")
+        self.assertEqual(decision["status"], "in_dialog")
+        self.assertFalse(decision["notify_manager"])
+        self.assertEqual(decision["reply_text"], "reply for needs_explanation")
+
     def test_handoff_can_target_account_specific_manager(self):
         self.set_stage("ready_to_test")
         history = "Я (менеджер Пульсар): Добрый день\n\nКлиент (@lead123): готов тестировать"

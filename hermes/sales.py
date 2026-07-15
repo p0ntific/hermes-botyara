@@ -51,6 +51,24 @@ EXPLICIT_NEGATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+QUESTION_BEFORE_HANDOFF_RE = re.compile(
+    r"("
+    r"\?"
+    r"|правильно\s+понял"
+    r"|верно\s+понял"
+    r"|сколько"
+    r"|стоим"
+    r"|цен"
+    r"|бесплат"
+    r"|сообщени"
+    r"|провер"
+    r"|как\s+это"
+    r"|как\s+работ"
+    r"|что\s+входит"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def get_last_client_message(history_text):
     matches = re.findall(
@@ -99,6 +117,22 @@ def stage_from_explicit_negative(history_text):
             "confidence": 1.0,
         }
     return None
+
+
+def defer_handoff_for_client_question(classification, history_text):
+    stage = normalize_stage(classification.get("stage"))
+    if stage not in HANDOFF_STAGES:
+        return classification
+
+    last_message = get_last_client_message(history_text)
+    if not last_message or not QUESTION_BEFORE_HANDOFF_RE.search(last_message):
+        return classification
+
+    updated = dict(classification)
+    updated["stage"] = "needs_explanation"
+    updated["reason"] = "клиент готов обсуждать, но в последней реплике задал вопрос; сначала отвечаем на вопрос"
+    updated["confidence"] = max(clamp_confidence(updated.get("confidence")), 0.9)
+    return updated
 
 
 def sanitize_outgoing(text):
@@ -335,6 +369,7 @@ class SalesBrain:
 
     def generate_conversational_reply(self, history_text, lead_key=None, manager_username=None):
         classification = self.classify_conversation_stage(history_text, lead_key=lead_key)
+        classification = defer_handoff_for_client_question(classification, history_text)
         decision = decide_action(classification)
         if classification.get("model"):
             decision["model"] = classification["model"]
