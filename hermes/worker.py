@@ -49,8 +49,11 @@ class AccountWorker:
     # --- lifecycle -------------------------------------------------------
 
     def build_client(self):
+        session = StringSession(self.cfg.session)
+        if session.server_address and session.port != 443:
+            session.set_dc(session.dc_id, session.server_address, 443)
         return TelegramClient(
-            StringSession(self.cfg.session),
+            session,
             self.cfg.api_id,
             self.cfg.api_hash,
             proxy=self.cfg.proxy,

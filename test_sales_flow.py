@@ -30,6 +30,7 @@ if "telethon.sessions" not in sys.modules:
     sys.modules["telethon.sessions"] = types.SimpleNamespace(StringSession=object)
 
 from hermes import sales
+from hermes import worker as worker_module
 from hermes.config import AccountConfig, Settings
 from hermes.sales import SalesBrain
 from hermes.store import Store
@@ -414,6 +415,33 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         lead = self.store.get_lead("legacy_lead")
         self.assertEqual(lead["account"], "main")
         self.assertEqual(lead["peer_id"], 777)
+
+
+class AccountConnectionTests(unittest.TestCase):
+    def test_build_client_normalizes_session_port_to_443(self):
+        class FakeSession:
+            dc_id = 2
+            server_address = "149.154.167.51"
+            port = 80
+
+            def set_dc(self, dc_id, server_address, port):
+                self.port = port
+
+        session = FakeSession()
+        original_session = worker_module.StringSession
+        original_client = worker_module.TelegramClient
+        worker_module.StringSession = lambda value: session
+        worker_module.TelegramClient = lambda session, *args, **kwargs: session
+        try:
+            cfg = AccountConfig(name="personal", api_id=1, api_hash="x", session="s")
+            worker = AccountWorker(cfg, make_settings(), None, None, None)
+
+            client = worker.build_client()
+
+            self.assertEqual(client.port, 443)
+        finally:
+            worker_module.StringSession = original_session
+            worker_module.TelegramClient = original_client
 
 
 if __name__ == "__main__":
