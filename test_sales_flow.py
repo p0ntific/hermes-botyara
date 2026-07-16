@@ -97,7 +97,46 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertEqual(decision["action"], "handoff_to_manager")
         self.assertEqual(decision["status"], "warm_notified")
         self.assertTrue(decision["notify_manager"])
+        self.assertIn("Он свяжется с вами", decision["reply_text"])
         self.assertEqual(decision["reply_text"], self.brain.handoff_message())
+
+    def test_affirmative_answer_to_interest_question_handoffs(self):
+        self.set_stage("primary_interest")
+
+        for message in ("Да", "Да, интересно", "Давайте", "Добрый день, да"):
+            with self.subTest(message=message):
+                history = (
+                    "Я (менеджер Пульсар): Было бы Вам интересно получать клиентов "
+                    f"в таком формате?\n\nКлиент (@lead123): {message}"
+                )
+                decision = self.brain.generate_conversational_reply(history)
+
+                self.assertEqual(decision["stage"], "ready_to_test")
+                self.assertEqual(decision["action"], "handoff_to_manager")
+                self.assertTrue(decision["notify_manager"])
+
+    def test_affirmative_answer_to_unrelated_question_keeps_dialog(self):
+        self.set_stage("primary_interest")
+        history = "Я (менеджер Пульсар): Ссылка открылась?\n\nКлиент (@lead123): Да"
+
+        decision = self.brain.generate_conversational_reply(history)
+
+        self.assertEqual(decision["action"], "send_reply")
+        self.assertFalse(decision["notify_manager"])
+
+    def test_manager_contact_promise_forces_handoff(self):
+        self.set_stage("primary_interest")
+        self.brain.render_stage_reply = lambda *args, **kwargs: (
+            "Передам информацию менеджеру. Он свяжется с вами."
+        )
+
+        decision = self.decide_for_message("интересно, расскажите")
+
+        self.assertEqual(decision["stage"], "ready_to_test")
+        self.assertEqual(decision["action"], "handoff_to_manager")
+        self.assertEqual(decision["status"], "warm_notified")
+        self.assertTrue(decision["notify_manager"])
+        self.assertIn("Он свяжется с вами", decision["reply_text"])
 
     def test_ready_to_test_with_client_question_answers_before_handoff(self):
         self.set_stage("ready_to_test")

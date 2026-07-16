@@ -69,10 +69,45 @@ QUESTION_BEFORE_HANDOFF_RE = re.compile(
     re.IGNORECASE,
 )
 
+AFFIRMATIVE_INTEREST_RE = re.compile(
+    r"^\s*(?:(?:здравствуйте|добрый\s+(?:день|вечер|утро))[,!.\s]+)?"
+    r"(?:да(?:\s*,?\s*интересно)?|давайте|интересно)\s*[.!…]*\s*$",
+    re.IGNORECASE,
+)
+
+INTEREST_QUESTION_RE = re.compile(
+    r"("
+    r"интересн\w*(?:\s+ли|\s+посмотреть|\s+узнать|\s+получать)"
+    r"|было\s+бы.{0,80}интересн"
+    r"|хотите.{0,80}(?:обсудить|посмотреть|подключ)"
+    r"|так\w*\s+формат"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+MANAGER_CONTACT_PROMISE_RE = re.compile(
+    r"("
+    r"подключ(?:у|им)\s+@"
+    r"|передам\b.{0,80}\bменеджер"
+    r"|(?:менеджер|он|мы|я)\b.{0,80}\b(?:свяжется|свяжемся|свяжусь|напишет|напишем|напишу)\b"
+    r"|с\s+вами\s+(?:скоро\s+)?свяжется\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def get_last_client_message(history_text):
     matches = re.findall(
         r"Клиент \(@[^)]*\):\s*(.*?)(?=\n\n(?:Я \(менеджер|Клиент \(@)|\Z)",
+        history_text,
+        re.DOTALL,
+    )
+    return matches[-1].strip() if matches else ""
+
+
+def get_last_manager_message(history_text):
+    matches = re.findall(
+        r"Я \(менеджер [^)]*\):\s*(.*?)(?=\n\n(?:Я \(менеджер|Клиент \(@)|\Z)",
         history_text,
         re.DOTALL,
     )
@@ -132,6 +167,27 @@ def defer_handoff_for_client_question(classification, history_text):
     updated["stage"] = "needs_explanation"
     updated["reason"] = "клиент готов обсуждать, но в последней реплике задал вопрос; сначала отвечаем на вопрос"
     updated["confidence"] = max(clamp_confidence(updated.get("confidence")), 0.9)
+    return updated
+
+
+def promote_affirmative_interest(classification, history_text):
+    stage = normalize_stage(classification.get("stage"))
+    if stage in HANDOFF_STAGES or stage in STOP_STAGES:
+        return classification
+
+    client_message = get_last_client_message(history_text)
+    manager_message = get_last_manager_message(history_text)
+    if (
+        not AFFIRMATIVE_INTEREST_RE.fullmatch(client_message)
+        or "?" not in manager_message
+        or not INTEREST_QUESTION_RE.search(manager_message)
+    ):
+        return classification
+
+    updated = dict(classification)
+    updated["stage"] = "ready_to_test"
+    updated["reason"] = "клиент подтвердил интерес в ответ на вопрос о формате поиска"
+    updated["confidence"] = 1.0
     return updated
 
 
@@ -356,6 +412,21 @@ class SalesBrain:
                 lead_key=lead_key,
                 manager_username=manager_username,
             )
+            if MANAGER_CONTACT_PROMISE_RE.search(decision["reply_text"]):
+                model = decision.get("model")
+                reply_text = decision["reply_text"]
+                decision.update(
+                    decide_action(
+                        {
+                            "stage": "ready_to_test",
+                            "reason": "ответ обещает клиенту связь с менеджером",
+                            "confidence": max(decision.get("confidence", 0), 0.9),
+                        }
+                    )
+                )
+                decision["reply_text"] = reply_text
+                if model:
+                    decision["model"] = model
         else:
             decision["action"] = "manual_review"
             decision["status"] = "manual_review"
@@ -369,6 +440,7 @@ class SalesBrain:
 
     def generate_conversational_reply(self, history_text, lead_key=None, manager_username=None):
         classification = self.classify_conversation_stage(history_text, lead_key=lead_key)
+        classification = promote_affirmative_interest(classification, history_text)
         classification = defer_handoff_for_client_question(classification, history_text)
         decision = decide_action(classification)
         if classification.get("model"):
