@@ -75,7 +75,11 @@ accounts:
             path = f.name
         self.addCleanup(os.unlink, path)
 
-        env = {"ACCOUNTS_FILE": path, "TEST_SESSION_MAIN": "secret-session"}
+        env = {
+            "ACCOUNTS_FILE": path,
+            "TEST_SESSION_MAIN": "secret-session",
+            "PROXY_URL": "socks5h://127.0.0.1:9051",
+        }
         with mock.patch.dict(os.environ, env, clear=False):
             settings = config.load_settings()
             accounts = config.load_accounts(settings)
@@ -84,7 +88,9 @@ accounts:
         self.assertEqual(accounts[0].session, "secret-session")
         self.assertEqual(accounts[0].manager_username, "andrew_pontific")
         self.assertEqual(accounts[0].cold_dm_daily_limit, 3)
+        self.assertEqual(accounts[0].proxy_url, "socks5h://127.0.0.1:9051")
         self.assertEqual(accounts[1].manager_username, settings.manager_username)
+        self.assertEqual(accounts[1].proxy_url, "socks5h://127.0.0.1:9052")
         self.assertEqual(accounts[1].proxy, {"proxy_type": "socks5", "addr": "127.0.0.1", "port": 9052})
 
     def test_legacy_env_fallback(self):

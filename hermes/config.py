@@ -160,7 +160,7 @@ def _load_accounts_yaml(path, settings):
                 api_id=int(raw["api_id"]),
                 api_hash=str(raw["api_hash"]),
                 session=str(raw["session"]),
-                proxy_url=str(raw.get("proxy") or ""),
+                proxy_url=str(raw.get("proxy") or settings.proxy_url),
                 manager_username=str(raw.get("manager_username") or settings.manager_username),
                 cold_dm_daily_limit=int(raw.get("cold_dm_daily_limit") or settings.cold_dm_daily_limit),
             )
