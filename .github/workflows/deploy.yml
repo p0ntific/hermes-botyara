@@ -132,4 +132,5 @@ jobs:
             cp ~/.hermes/hermes-dashboard.service ~/.config/systemd/user/
             systemctl --user daemon-reload
             systemctl --user restart tg_lead_skill.service
-            systemctl --user enable --now hermes-dashboard.service
+            systemctl --user enable hermes-dashboard.service
+            systemctl --user restart hermes-dashboard.service
