@@ -93,6 +93,7 @@ jobs:
               printf '    api_hash: ${API_HASH}\n' >> accounts.yaml
               printf '    session: ${SESSION}\n' >> accounts.yaml
               printf '    manager_username: MaksIgitov\n' >> accounts.yaml
+              printf '    cold_dm_daily_limit: 10\n' >> accounts.yaml
             fi
 
             if has_env_value API_ID_PERSONAL && has_env_value API_HASH_PERSONAL && has_env_value SESSION_PERSONAL; then
@@ -101,7 +102,7 @@ jobs:
               printf '    api_hash: ${API_HASH_PERSONAL}\n' >> accounts.yaml
               printf '    session: ${SESSION_PERSONAL}\n' >> accounts.yaml
               printf '    manager_username: andrew_pontific\n' >> accounts.yaml
-              printf '    cold_dm_daily_limit: 3\n' >> accounts.yaml
+              printf '    cold_dm_daily_limit: 10\n' >> accounts.yaml
             fi
 
             if [ "$(grep -c 'name:' accounts.yaml)" -eq 0 ]; then
