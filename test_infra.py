@@ -130,15 +130,15 @@ accounts:
 
 
 class DashboardSecurityTests(unittest.TestCase):
-    def test_rejects_ip_outside_whitelist(self):
+    def test_cookie_token_authentication(self):
         request = types.SimpleNamespace(
-            client_address=("203.0.113.2", 1234),
-            dashboard=types.SimpleNamespace(allowed_ips={"198.51.100.1"}),
-            send_error=mock.Mock(),
+            headers={"Cookie": "hermes=secret"},
+            dashboard=types.SimpleNamespace(token="secret"),
         )
 
-        self.assertFalse(Handler.allowed(request))
-        request.send_error.assert_called_once_with(403)
+        self.assertTrue(Handler.authorized(request))
+        request.headers = {"Cookie": "hermes=wrong"}
+        self.assertFalse(Handler.authorized(request))
 
     def test_qr_is_rendered_locally(self):
         svg = qr_svg("tg://login?token=secret")

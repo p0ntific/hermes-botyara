@@ -70,6 +70,9 @@ jobs:
             }
 
             merge_env ACCOUNTS_FILE accounts.yaml
+            if ! has_env_value DASHBOARD_TOKEN; then
+              merge_env DASHBOARD_TOKEN "$(openssl rand -hex 32)"
+            fi
             for key in \
               API_ID API_HASH SESSION \
               API_ID_PERSONAL API_HASH_PERSONAL SESSION_PERSONAL \

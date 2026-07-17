@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -69,8 +70,11 @@ class Dashboard:
         self.settings = load_settings()
         self.store = Store(self.settings.db_path)
         self.csrf = secrets.token_urlsafe(24)
-        self.allowed_ips = {
-            ip.strip() for ip in os.getenv("DASHBOARD_ALLOWED_IPS", "127.0.0.1").split(",") if ip.strip()
+        self.token = os.getenv("DASHBOARD_TOKEN", "")
+        if not self.token:
+            raise RuntimeError("DASHBOARD_TOKEN is required")
+        self.bootstrap_ips = {
+            ip.strip() for ip in os.getenv("DASHBOARD_BOOTSTRAP_IPS", "127.0.0.1").split(",") if ip.strip()
         }
         self.qr = {"status": "idle", "url": "", "error": "", "name": ""}
         self.qr_lock = threading.Lock()
@@ -214,14 +218,32 @@ class Dashboard:
 class Handler(BaseHTTPRequestHandler):
     dashboard = None
 
-    def allowed(self):
-        if self.client_address[0] not in self.dashboard.allowed_ips:
-            self.send_error(403)
+    def authorized(self):
+        cookie = SimpleCookie()
+        cookie.load(self.headers.get("Cookie", ""))
+        value = cookie.get("hermes")
+        return bool(value) and secrets.compare_digest(value.value, self.dashboard.token)
+
+    def require_auth(self):
+        if not self.authorized():
+            self.send_error(401)
             return False
         return True
 
     def do_GET(self):
-        if not self.allowed():
+        if self.path == "/bootstrap":
+            if self.client_address[0] not in self.dashboard.bootstrap_ips:
+                self.send_error(403)
+                return
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header(
+                "Set-Cookie",
+                f"hermes={self.dashboard.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000",
+            )
+            self.end_headers()
+            return
+        if not self.require_auth():
             return
         if self.path != "/":
             self.send_error(404)
@@ -237,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if not self.allowed():
+        if not self.require_auth():
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
