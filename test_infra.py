@@ -31,6 +31,7 @@ if "telethon.sessions" not in sys.modules:
     sys.modules["telethon.sessions"] = types.SimpleNamespace(StringSession=object)
 
 from hermes import config
+from hermes.dashboard import Handler, qr_svg
 from hermes.dispatcher import Dispatcher
 from hermes.llm import LLMRouter, LLMUnavailable
 from hermes.store import Store
@@ -126,6 +127,23 @@ accounts:
             settings = config.load_settings()
             with self.assertRaises(ValueError):
                 config.load_accounts(settings)
+
+
+class DashboardSecurityTests(unittest.TestCase):
+    def test_rejects_ip_outside_whitelist(self):
+        request = types.SimpleNamespace(
+            client_address=("203.0.113.2", 1234),
+            dashboard=types.SimpleNamespace(allowed_ips={"198.51.100.1"}),
+            send_error=mock.Mock(),
+        )
+
+        self.assertFalse(Handler.allowed(request))
+        request.send_error.assert_called_once_with(403)
+
+    def test_qr_is_rendered_locally(self):
+        svg = qr_svg("tg://login?token=secret")
+        self.assertIn("<svg", svg)
+        self.assertNotIn("secret", svg)
 
 
 class LLMRoutesConfigTests(unittest.TestCase):
@@ -349,6 +367,21 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         self.assertGreater(store.get_cooldown_remaining("main"), 100)
         self.assertEqual(store.get_cooldown_remaining("second"), 0)
 
+    def test_runtime_account_controls_and_dashboard(self):
+        store = self.make_store()
+        store.ensure_account("main")
+        store.set_account_enabled("main", False)
+        store.set_daily_limit("main", 7)
+        store.add_contacted("cold", "main", "stopped")
+        store.add_contacted("warm", "main", "warm_notified")
+
+        self.assertFalse(store.account_enabled("main"))
+        self.assertEqual(store.daily_limit("main", 3), 7)
+        snapshot = store.dashboard_snapshot()
+        self.assertEqual(snapshot["dropped"], 1)
+        self.assertEqual(snapshot["warm"], 1)
+        self.assertEqual(snapshot["accounts"][0]["enabled"], 0)
+
     def test_legacy_json_migration(self):
         import json
 
@@ -414,6 +447,16 @@ class _FakeNotifier:
 
 
 class AccountWorkerQueueTests(TempStoreMixin, unittest.TestCase):
+    def test_disabled_account_has_no_capacity(self):
+        store = self.make_store()
+        store.ensure_account("main")
+        store.set_account_enabled("main", False)
+        cfg = config.AccountConfig(name="main", api_id=1, api_hash="hash", session="session")
+        worker = AccountWorker(cfg, make_settings(), store, _FakeBrain(), _FakeNotifier())
+        worker.is_connected = lambda: True
+
+        self.assertFalse(worker.has_capacity())
+
     def test_process_lead_skips_existing_lead_without_sending(self):
         store = self.make_store()
         store.add_contacted("lead_x", "other", "sent")

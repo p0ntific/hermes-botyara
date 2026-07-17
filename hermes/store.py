@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS account_state (
     last_error TEXT,
     last_dispatch_at REAL NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS account_control (
+    account TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    daily_limit INTEGER
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -387,6 +392,41 @@ class Store:
             self._conn.execute(
                 "INSERT OR IGNORE INTO account_state (account) VALUES (?)", (account,)
             )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO account_control (account) VALUES (?)", (account,)
+            )
+            self._conn.commit()
+
+    def account_enabled(self, account):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT enabled FROM account_control WHERE account=?", (account,)
+            ).fetchone()
+            return row is None or bool(row["enabled"])
+
+    def set_account_enabled(self, account, enabled):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO account_control (account, enabled) VALUES (?,?)
+                   ON CONFLICT(account) DO UPDATE SET enabled=excluded.enabled""",
+                (account, 1 if enabled else 0),
+            )
+            self._conn.commit()
+
+    def daily_limit(self, account, default):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT daily_limit FROM account_control WHERE account=?", (account,)
+            ).fetchone()
+            return int(row["daily_limit"]) if row and row["daily_limit"] is not None else default
+
+    def set_daily_limit(self, account, limit):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO account_control (account, daily_limit) VALUES (?,?)
+                   ON CONFLICT(account) DO UPDATE SET daily_limit=excluded.daily_limit""",
+                (account, int(limit)),
+            )
             self._conn.commit()
 
     def get_cooldown_remaining(self, account):
@@ -499,3 +539,31 @@ class Store:
                 "SELECT * FROM queue ORDER BY enqueued_at DESC LIMIT ?", (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def dashboard_snapshot(self):
+        with self._lock:
+            accounts = self._conn.execute(
+                """SELECT s.account, s.healthy, s.cooldown_until, s.cooldown_reason,
+                          s.last_error, COALESCE(c.enabled, 1) AS enabled, c.daily_limit
+                   FROM account_state s LEFT JOIN account_control c ON c.account=s.account
+                   ORDER BY s.account"""
+            ).fetchall()
+            stages = self._conn.execute(
+                """SELECT COALESCE(last_stage, 'без этапа') AS name, COUNT(*) AS count
+                   FROM leads GROUP BY COALESCE(last_stage, 'без этапа') ORDER BY count DESC"""
+            ).fetchall()
+            statuses = dict(self._conn.execute(
+                "SELECT status, COUNT(*) FROM leads GROUP BY status"
+            ).fetchall())
+            queued = self._conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
+            pending = self._conn.execute(
+                "SELECT COUNT(*) FROM queue WHERE status IN ('pending', 'processing')"
+            ).fetchone()[0]
+            return {
+                "accounts": [dict(row) for row in accounts],
+                "stages": [dict(row) for row in stages],
+                "received": int(queued),
+                "pending": int(pending),
+                "dropped": int(statuses.get("stopped", 0)),
+                "warm": int(statuses.get("warm_notified", 0)),
+            }

@@ -113,12 +113,15 @@ def load_settings():
 
 def load_accounts(settings):
     """Accounts come from accounts.yaml; falls back to legacy single-account env vars."""
-    path = settings.accounts_file
-    if path and os.path.exists(path):
-        accounts = _load_accounts_yaml(path, settings)
-        if accounts:
-            return accounts
-        logger.warning(f"{path} contains no enabled accounts, falling back to env")
+    accounts = []
+    for path in (settings.accounts_file, os.getenv("RUNTIME_ACCOUNTS_FILE", "runtime_accounts.yaml")):
+        if path and os.path.exists(path):
+            accounts.extend(_load_accounts_yaml(path, settings))
+    names = [account.name for account in accounts]
+    if len(names) != len(set(names)):
+        raise ValueError("Duplicate account names across account files")
+    if accounts:
+        return accounts
 
     api_id = _int_env("API_ID", 0)
     api_hash = os.getenv("API_HASH", "")

@@ -70,6 +70,7 @@ class AccountWorker:
             await self.client.run_until_disconnected()
         finally:
             self.healthy = False
+            self.store.set_account_health(self.name, False)
 
     async def stop(self):
         self.healthy = False
@@ -94,15 +95,20 @@ class AccountWorker:
         return bool(self.client) and self.healthy and self.client.is_connected()
 
     def has_capacity(self):
+        if not self.store.account_enabled(self.name):
+            return False
         if not self.is_connected() or self.pitch_lock.locked():
             return False
         if self.store.get_cooldown_remaining(self.name) > 0:
             return False
-        return self.store.sent_today(self.name) < self.cfg.cold_dm_daily_limit
+        limit = self.store.daily_limit(self.name, self.cfg.cold_dm_daily_limit)
+        return self.store.sent_today(self.name) < limit
 
     # --- lead feed ---------------------------------------------------------
 
     async def _lead_feed_handler(self, event):
+        if not self.store.account_enabled(self.name):
+            return
         text = event.raw_text
         target_user = sales.extract_target_username(text)
         if not target_user:
@@ -143,6 +149,9 @@ class AccountWorker:
             )
             logger.info(f"[{self.name}] sleeping for {delay}s before pitching @{target_user}...")
             await asyncio.sleep(delay)
+
+            if not self.store.account_enabled(self.name):
+                raise PitchRetryable(f"account {self.name} disabled")
 
             cooldown_remaining = self.store.get_cooldown_remaining(self.name)
             if cooldown_remaining > 0:
@@ -194,7 +203,7 @@ class AccountWorker:
     # --- private replies -----------------------------------------------------
 
     async def _pm_handler(self, event):
-        if not event.is_private:
+        if not event.is_private or not self.store.account_enabled(self.name):
             return
 
         sender = await event.get_sender()
@@ -238,6 +247,9 @@ class AccountWorker:
     async def process_private_reply(self, chat_id, sender_username, target_key):
         try:
             await asyncio.sleep(self.settings.incoming_reply_debounce_seconds)
+
+            if not self.store.account_enabled(self.name):
+                return
 
             lead = self.store.get_lead(target_key)
             if lead is None:

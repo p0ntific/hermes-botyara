@@ -19,7 +19,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          source: "tg_lead_skill.py,hermes,requirements.txt"
+          source: "tg_lead_skill.py,hermes,requirements.txt,hermes-dashboard.service"
           target: "~/.hermes/"
 
       - name: Sync Runtime Secrets
@@ -124,6 +124,9 @@ jobs:
             # Ensure dependencies are up to date
             ~/.local/bin/pip3 install -r ~/.hermes/requirements.txt --user --break-system-packages
 
-            # Restart the service
+            # Restart services
+            mkdir -p ~/.config/systemd/user
+            cp ~/.hermes/hermes-dashboard.service ~/.config/systemd/user/
             systemctl --user daemon-reload
             systemctl --user restart tg_lead_skill.service
+            systemctl --user enable --now hermes-dashboard.service
