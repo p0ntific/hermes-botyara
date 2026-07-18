@@ -31,6 +31,18 @@ jobs:
           API_ID_PERSONAL: ${{ secrets.API_ID_PERSONAL }}
           API_HASH_PERSONAL: ${{ secrets.API_HASH_PERSONAL }}
           SESSION_PERSONAL: ${{ secrets.SESSION_PERSONAL }}
+          API_ID_ACC01: ${{ secrets.API_ID_ACC01 }}
+          API_HASH_ACC01: ${{ secrets.API_HASH_ACC01 }}
+          SESSION_ACC01: ${{ secrets.SESSION_ACC01 }}
+          API_ID_ACC02: ${{ secrets.API_ID_ACC02 }}
+          API_HASH_ACC02: ${{ secrets.API_HASH_ACC02 }}
+          SESSION_ACC02: ${{ secrets.SESSION_ACC02 }}
+          API_ID_ACC03: ${{ secrets.API_ID_ACC03 }}
+          API_HASH_ACC03: ${{ secrets.API_HASH_ACC03 }}
+          SESSION_ACC03: ${{ secrets.SESSION_ACC03 }}
+          API_ID_ACC14: ${{ secrets.API_ID_ACC14 }}
+          API_HASH_ACC14: ${{ secrets.API_HASH_ACC14 }}
+          SESSION_ACC14: ${{ secrets.SESSION_ACC14 }}
           TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           BOT_CHAT_ID: ${{ secrets.BOT_CHAT_ID }}
@@ -46,7 +58,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          envs: API_ID,API_HASH,SESSION,API_ID_PERSONAL,API_HASH_PERSONAL,SESSION_PERSONAL,TARGET_CHAT,BOT_TOKEN,BOT_CHAT_ID,PROXY_URL,LLM_PROVIDER,OPENROUTER_API_KEY,OPENROUTER_MODEL,YANDEX_CLOUD_FOLDER,YANDEX_CLOUD_API_KEY,YANDEX_CLOUD_MODEL,LLM_FALLBACK_PROVIDER
+          envs: API_ID,API_HASH,SESSION,API_ID_PERSONAL,API_HASH_PERSONAL,SESSION_PERSONAL,API_ID_ACC01,API_HASH_ACC01,SESSION_ACC01,API_ID_ACC02,API_HASH_ACC02,SESSION_ACC02,API_ID_ACC03,API_HASH_ACC03,SESSION_ACC03,API_ID_ACC14,API_HASH_ACC14,SESSION_ACC14,TARGET_CHAT,BOT_TOKEN,BOT_CHAT_ID,PROXY_URL,LLM_PROVIDER,OPENROUTER_API_KEY,OPENROUTER_MODEL,YANDEX_CLOUD_FOLDER,YANDEX_CLOUD_API_KEY,YANDEX_CLOUD_MODEL,LLM_FALLBACK_PROVIDER
           script: |
             set -eu
             cd ~/.hermes
@@ -69,6 +81,22 @@ jobs:
               [ -n "$value" ]
             }
 
+            append_account() {
+              name="$1"
+              id_key="$2"
+              hash_key="$3"
+              session_key="$4"
+              manager="$5"
+              cold_limit="$6"
+              printf '  - name: %s\n' "$name" >> accounts.yaml
+              printf '    api_id: ${%s}\n' "$id_key" >> accounts.yaml
+              printf '    api_hash: ${%s}\n' "$hash_key" >> accounts.yaml
+              printf '    session: ${%s}\n' "$session_key" >> accounts.yaml
+              printf '    proxy: socks5h://127.0.0.1:9051\n' >> accounts.yaml
+              printf '    manager_username: %s\n' "$manager" >> accounts.yaml
+              printf '    cold_dm_daily_limit: %s\n' "$cold_limit" >> accounts.yaml
+            }
+
             merge_env ACCOUNTS_FILE accounts.yaml
             if ! has_env_value DASHBOARD_TOKEN; then
               merge_env DASHBOARD_TOKEN "$(openssl rand -hex 32)"
@@ -76,6 +104,10 @@ jobs:
             for key in \
               API_ID API_HASH SESSION \
               API_ID_PERSONAL API_HASH_PERSONAL SESSION_PERSONAL \
+              API_ID_ACC01 API_HASH_ACC01 SESSION_ACC01 \
+              API_ID_ACC02 API_HASH_ACC02 SESSION_ACC02 \
+              API_ID_ACC03 API_HASH_ACC03 SESSION_ACC03 \
+              API_ID_ACC14 API_HASH_ACC14 SESSION_ACC14 \
               TARGET_CHAT BOT_TOKEN BOT_CHAT_ID PROXY_URL \
               LLM_PROVIDER OPENROUTER_API_KEY OPENROUTER_MODEL \
               YANDEX_CLOUD_FOLDER YANDEX_CLOUD_API_KEY YANDEX_CLOUD_MODEL \
@@ -106,6 +138,20 @@ jobs:
               printf '    session: ${SESSION_PERSONAL}\n' >> accounts.yaml
               printf '    manager_username: andrew_pontific\n' >> accounts.yaml
               printf '    cold_dm_daily_limit: 10\n' >> accounts.yaml
+            fi
+
+            # Order-772563 working accounts: 2 -> Andrew, 2 -> Maks
+            if has_env_value API_ID_ACC01 && has_env_value API_HASH_ACC01 && has_env_value SESSION_ACC01; then
+              append_account acc01 API_ID_ACC01 API_HASH_ACC01 SESSION_ACC01 andrew_pontific 3
+            fi
+            if has_env_value API_ID_ACC02 && has_env_value API_HASH_ACC02 && has_env_value SESSION_ACC02; then
+              append_account acc02 API_ID_ACC02 API_HASH_ACC02 SESSION_ACC02 andrew_pontific 3
+            fi
+            if has_env_value API_ID_ACC03 && has_env_value API_HASH_ACC03 && has_env_value SESSION_ACC03; then
+              append_account acc03 API_ID_ACC03 API_HASH_ACC03 SESSION_ACC03 MaksIgitov 3
+            fi
+            if has_env_value API_ID_ACC14 && has_env_value API_HASH_ACC14 && has_env_value SESSION_ACC14; then
+              append_account acc14 API_ID_ACC14 API_HASH_ACC14 SESSION_ACC14 MaksIgitov 3
             fi
 
             if [ "$(grep -c 'name:' accounts.yaml)" -eq 0 ]; then
