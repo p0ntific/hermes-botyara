@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import uuid
 import datetime
 import asyncio
 import random
@@ -44,6 +45,8 @@ SEND_DELAY_MAX_SECONDS = int(os.getenv("SEND_DELAY_MAX_SECONDS", 600))
 GENERIC_LIMIT_COOLDOWN_SECONDS = int(os.getenv("GENERIC_LIMIT_COOLDOWN_SECONDS", 5 * 60 * 60))
 FLOOD_WAIT_EXTRA_SECONDS = int(os.getenv("FLOOD_WAIT_EXTRA_SECONDS", 5 * 60))
 INCOMING_REPLY_DEBOUNCE_SECONDS = int(os.getenv("INCOMING_REPLY_DEBOUNCE_SECONDS", 20))
+NOTIFY_RETRY_INTERVAL_SECONDS = int(os.getenv("NOTIFY_RETRY_INTERVAL_SECONDS", 300))
+REPLY_DAILY_CAP = int(os.getenv("REPLY_DAILY_CAP", 10))
 
 llm_client = openai.OpenAI(
     api_key=YANDEX_CLOUD_API_KEY,
@@ -52,11 +55,13 @@ llm_client = openai.OpenAI(
 
 db_lock = asyncio.Lock()
 outbound_lock = asyncio.Lock()
+notify_flush_lock = asyncio.Lock()
 cooldown_until = 0
 pending_leads = set()
 pending_reply_tasks = {}
+reply_locks = {}
 admin_entity = None
-bot_api_failed = False
+bot_api_disabled = False
 
 PROXY = None
 if PROXY_URL:
@@ -73,31 +78,47 @@ def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r') as f:
             db = json.load(f)
-            db.setdefault("contacted", {})
-            db.setdefault("last_reset", str(datetime.date.today()))
-            return db
-    return {"contacted": {}, "last_reset": str(datetime.date.today())}
+    else:
+        db = {}
+    db.setdefault("contacted", {})
+    db.setdefault("pending_notifications", [])
+    db.setdefault("last_reset", str(datetime.date.today()))
+    return db
 
 def save_db(db):
     with open(DB_FILE, 'w') as f:
         json.dump(db, f, indent=2)
 
+# Statuses that did not consume an outbound cold DM and must not eat the daily limit.
+NON_CONSUMING_STATUSES = {"manual_required", "skipped", "missed_limit"}
+
 def can_message_today(db):
     today = str(datetime.date.today())
-    if db.get("last_reset") != today:
-        db["last_reset"] = today
-    
-    count_today = sum(
+    sent_today = sum(
         1
         for v in db["contacted"].values()
-        if v.get("date") == today and v.get("status") not in {"manual_required", "skipped"}
+        if v.get("date") == today and v.get("status") not in NON_CONSUMING_STATUSES
     )
-    return count_today < COLD_DM_DAILY_LIMIT
+    return sent_today < COLD_DM_DAILY_LIMIT
 
-async def mark_lead_processed(target_user, status):
+def normalize_key(value):
+    return str(value or "").strip().lstrip("@").lower()
+
+def find_contact_key(db, *candidates):
+    contacted = db["contacted"]
+    for candidate in candidates:
+        if candidate and str(candidate) in contacted:
+            return str(candidate)
+    normalized = {normalize_key(c) for c in candidates if c}
+    for key in contacted:
+        if normalize_key(key) in normalized:
+            return key
+    return None
+
+async def mark_lead_processed(record_key, status):
     async with db_lock:
         db = load_db()
-        db["contacted"][str(target_user)] = {
+        db["contacted"][str(record_key)] = {
             "date": str(datetime.date.today()),
             "timestamp": time.time(),
             "reply_count": 0,
@@ -106,6 +127,7 @@ async def mark_lead_processed(target_user, status):
             "last_stage": None,
             "last_action": None,
             "manager_notified_at": None,
+            "last_notified_action": None,
             "stop_reason": None,
         }
         save_db(db)
@@ -125,6 +147,12 @@ def extract_target_username(text):
         if username_match:
             return username_match.group(1)
     return None
+
+def lead_context_from_text(text):
+    context_match = re.search(r'📄\s*Оригинал\n+(.*)', text, re.DOTALL)
+    if context_match:
+        return context_match.group(1).strip()
+    return text
 
 CONVERSATION_STAGES = {
     "primary_interest",
@@ -154,11 +182,14 @@ SEND_REPLY_STAGES = {
     "qualification_needed",
     "objection_without_commitment",
 }
-TERMINAL_STATUSES = {"warm_notified", "stopped", "manual_review"}
+# manual_review is intentionally NOT terminal: the dialog stays open so that a lead
+# who agrees after an ambiguous message still gets handed off instead of being dropped.
+TERMINAL_STATUSES = {"warm_notified", "stopped"}
 LOW_CONFIDENCE_THRESHOLD = 0.55
 
+# Word-boundary guards so that e.g. "стоп" inside "постоплата" is not a refusal.
 EXPLICIT_NEGATIVE_RE = re.compile(
-    r"("
+    r"(?<![а-яёa-z0-9])("
     r"не\s+(?:интересно|актуально|надо|нужно)"
     r"|не\s+рассматриваем"
     r"|не\s+пишите"
@@ -166,9 +197,10 @@ EXPLICIT_NEGATIVE_RE = re.compile(
     r"|отказываюсь"
     r"|удалите"
     r"|стоп"
-    r")",
+    r")(?![а-яёa-z0-9])",
     re.IGNORECASE,
 )
+EXPLICIT_NEGATIVE_MAX_CHARS = 80
 
 def get_last_client_message(history_text):
     matches = re.findall(
@@ -201,6 +233,14 @@ def extract_json_object(output):
     except Exception:
         return None
 
+def clean_llm_output(output):
+    output = output.strip()
+    if "</think>" in output:
+        output = output.split("</think>")[-1].strip()
+    output = re.sub(r"^```[a-zA-Z]*\s*", "", output)
+    output = re.sub(r"\s*```\s*$", "", output)
+    return output.replace("—", "-").replace("–", "-").strip()
+
 def clamp_confidence(value):
     try:
         confidence = float(value)
@@ -213,7 +253,13 @@ def normalize_stage(stage):
 
 def stage_from_explicit_negative(history_text):
     last_message = get_last_client_message(history_text)
-    if last_message and EXPLICIT_NEGATIVE_RE.search(last_message):
+    if not last_message:
+        return None
+    # A long message or a question ("мне ничего не надо настраивать?") is not a hard
+    # refusal even if it contains a negative phrase - let the LLM classify it.
+    if len(last_message) > EXPLICIT_NEGATIVE_MAX_CHARS or "?" in last_message:
+        return None
+    if EXPLICIT_NEGATIVE_RE.search(last_message):
         return {
             "stage": "not_interested",
             "reason": "клиент явно отказался или попросил не писать",
@@ -242,11 +288,15 @@ async def activate_cooldown(seconds, reason):
     logger.warning(f"Outbound Telegram cooldown activated for {seconds}s: {reason}")
 
 
+BOT_API_AUTH_ERROR_MARKERS = ("401", "403", "404", "unauthorized", "forbidden", "chat not found")
+
 async def notify_admin(client, message):
-    global admin_entity, bot_api_failed
+    """Deliver a message to the admin chat. Returns True only on confirmed delivery."""
+    global admin_entity, bot_api_disabled
     if not BOT_CHAT_ID:
-        return
-    if BOT_TOKEN and not bot_api_failed:
+        logger.error("BOT_CHAT_ID is not configured; admin notification cannot be delivered.")
+        return False
+    if BOT_TOKEN and not bot_api_disabled:
         def send_notification():
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
@@ -259,11 +309,16 @@ async def notify_admin(client, message):
 
         try:
             await asyncio.to_thread(send_notification)
-            return
+            return True
         except Exception as e:
-            bot_api_failed = True
             safe_error = str(e).replace(BOT_TOKEN, "<token>") if BOT_TOKEN else str(e)
-            logger.error(f"Failed to send admin notification via Bot API; disabling Bot API notifications until restart: {safe_error}")
+            # Disable the Bot API path only for credential/config errors; transient
+            # network failures should keep retrying on the next notification.
+            if any(marker in safe_error.lower() for marker in BOT_API_AUTH_ERROR_MARKERS):
+                bot_api_disabled = True
+                logger.error(f"Bot API rejected the request; disabling Bot API notifications until restart: {safe_error}")
+            else:
+                logger.warning(f"Bot API notification failed; falling back to MTProto: {safe_error}")
 
     try:
         if admin_entity is None:
@@ -294,13 +349,88 @@ async def notify_admin(client, message):
             raise RuntimeError(f"Could not resolve admin chat entity for BOT_CHAT_ID={BOT_CHAT_ID}")
 
         await client.send_message(admin_entity, message)
+        return True
     except Exception as e:
         logger.error(f"Failed to send admin notification via MTProto: {e}")
+        return False
+
+MAX_PENDING_NOTIFICATIONS = 200
+
+def queue_admin_notification(db, text):
+    """Persist a notification in the DB-backed outbox. Call while holding db_lock."""
+    queue = db["pending_notifications"]
+    queue.append({
+        "id": uuid.uuid4().hex,
+        "text": text,
+        "created_at": time.time(),
+    })
+    overflow = len(queue) - MAX_PENDING_NOTIFICATIONS
+    if overflow > 0:
+        del queue[:overflow]
+        logger.error(f"Pending notification queue overflow; dropped {overflow} oldest notifications.")
+
+async def flush_admin_notifications(client):
+    """Deliver queued notifications in order; an entry is removed only after delivery."""
+    async with notify_flush_lock:
+        while True:
+            async with db_lock:
+                db = load_db()
+                pending = list(db["pending_notifications"])
+            if not pending:
+                return
+            item = pending[0]
+            delivered = await notify_admin(client, item["text"])
+            if not delivered:
+                logger.warning(
+                    f"Admin notification not delivered yet; {len(pending)} item(s) stay in the queue for retry."
+                )
+                return
+            async with db_lock:
+                db = load_db()
+                db["pending_notifications"] = [
+                    entry for entry in db["pending_notifications"] if entry.get("id") != item["id"]
+                ]
+                save_db(db)
+
+async def send_admin_notification(client, text):
+    """Queue a notification durably, then try to deliver it right away."""
+    async with db_lock:
+        db = load_db()
+        queue_admin_notification(db, text)
+        save_db(db)
+    await flush_admin_notifications(client)
+
+async def admin_notification_worker(client):
+    """Background retry loop so queued notifications survive transient failures."""
+    while True:
+        await asyncio.sleep(NOTIFY_RETRY_INTERVAL_SECONDS)
+        try:
+            await flush_admin_notifications(client)
+        except Exception as e:
+            logger.error(f"Admin notification retry worker failed: {e}")
 
 def manual_message_notice(target_user, message_text):
     if not message_text:
         return f"Напишите вручную @{target_user}."
     return f"Напишите вручную @{target_user}: \"{message_text}\""
+
+async def park_lead_for_manual(client, record_key, target_user, pitch_message, reason):
+    """Record the lead as manual_required and make sure the admin chat hears about it."""
+    await mark_lead_processed(record_key, "manual_required")
+    await send_admin_notification(client, f"⏸ {reason}. {manual_message_notice(target_user, pitch_message)}")
+    logger.info(f"Parked lead @{target_user} for manual outreach: {reason}")
+
+LIMIT_NOTICE_CONTEXT_CHARS = 200
+
+async def mark_missed_limit(client, record_key, target_user, lead_text):
+    """Record a lead skipped by the daily limit and report it instead of dropping it."""
+    await mark_lead_processed(record_key, "missed_limit")
+    snippet = " ".join(lead_text.split())[:LIMIT_NOTICE_CONTEXT_CHARS]
+    await send_admin_notification(
+        client,
+        f"⏸ Дневной лимит холодных сообщений исчерпан, бот не написал @{target_user}. "
+        f"Контекст лида: {snippet}",
+    )
 
 async def build_pitch_message(target_user, lead_context):
     pitch_message = await asyncio.to_thread(generate_pitch, lead_context)
@@ -319,15 +449,6 @@ async def build_pitch_message(target_user, lead_context):
         )
 
     return pitch_message
-
-async def notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining):
-    logger.info(
-        f"Outbound Telegram cooldown active for {cooldown_remaining // 60} min. "
-        f"Bot did not message @{target_user}. Manual text would be: {pitch_message}"
-    )
-
-async def notify_skipped_lead(client, target_user, reason):
-    logger.info(f"Skipped lead @{target_user}: {reason}.")
 
 def generate_pitch(lead_context):
     system_prompt = f"""Ты эксперт по B2B продажам. Твоя задача — написать первое сообщение для потенциального клиента (лида) в Telegram.
@@ -364,35 +485,26 @@ def generate_pitch(lead_context):
         output = response.choices[0].message.content
         if not output: return None
         output = output.strip()
-        
+
         if "SKIP" in output.upper():
             if len(output) < 20 or "SKIP" in output.upper()[-50:]:
                 return "SKIP"
             if not re.search(r'[А-Яа-я]', output):
                 return "SKIP"
-        
+
         if len(output) > 1000:
             logger.warning(f"Generated pitch is too long ({len(output)} chars). Skipping to avoid spam.")
             return "SKIP"
-        
-        if "</think>" in output:
-            output = output.split("</think>")[-1].strip()
-        elif "<think>" in output:
+
+        if "<think>" in output and "</think>" not in output:
             return None
 
-        output = re.sub(r"^```[a-zA-Z]*\s*", "", output)
-        output = re.sub(r"\s*```\s*$", "", output)
-        output = output.replace("—", "-").replace("–", "-")
-        return output.strip()
+        return clean_llm_output(output) or None
     except Exception as e:
         logger.error(f"Failed to generate pitch via Yandex Cloud: {e}")
         return None
 
-def classify_conversation_stage(history_text):
-    explicit_negative = stage_from_explicit_negative(history_text)
-    if explicit_negative:
-        return explicit_negative
-
+def query_stage_classifier(history_text):
     system_prompt = f"""Ты классификатор стадии B2B sales-диалога продукта {PRODUCT_NAME}.
 Твоя задача - НЕ писать ответ клиенту, а только определить стадию последнего сообщения клиента.
 
@@ -440,6 +552,22 @@ def classify_conversation_stage(history_text):
     except Exception as e:
         logger.error(f"Failed to classify conversation stage: {e}")
         return {"stage": "unknown", "reason": "ошибка классификатора", "confidence": 0.0}
+
+def classify_conversation_stage(history_text):
+    explicit_negative = stage_from_explicit_negative(history_text)
+    if explicit_negative:
+        return explicit_negative
+
+    classification = query_stage_classifier(history_text)
+    if classification["stage"] != "unknown" and classification["confidence"] >= LOW_CONFIDENCE_THRESHOLD:
+        return classification
+
+    # One retry before falling back to manual review: a single LLM hiccup must not
+    # pause a live dialog and ping the manager for nothing.
+    retry = query_stage_classifier(history_text)
+    candidates = [classification, retry]
+    candidates.sort(key=lambda c: (c["stage"] != "unknown", c["confidence"]), reverse=True)
+    return candidates[0]
 
 def decide_action(classification):
     stage = normalize_stage(classification.get("stage"))
@@ -521,13 +649,7 @@ def render_stage_reply(decision, history_text):
         output = response.choices[0].message.content
         if not output:
             return fallback_reply_for_stage(stage)
-        output = output.strip()
-        if "</think>" in output:
-            output = output.split("</think>")[-1].strip()
-        output = re.sub(r"^```[a-zA-Z]*\s*", "", output)
-        output = re.sub(r"\s*```\s*$", "", output)
-        output = output.strip().strip('"')
-        output = output.replace("—", "-").replace("–", "-")
+        output = clean_llm_output(output).strip('"')
         if len(output) > 600:
             logger.warning(f"Generated stage reply is too long ({len(output)} chars). Using fallback.")
             return fallback_reply_for_stage(stage)
@@ -574,231 +696,259 @@ async def get_history_text(client, chat_id, sender_username, limit=20):
     messages.reverse()
     return format_history(messages, sender_username)
 
-def manager_notification_text(sender_username, decision, history_text):
+def manager_notification_text(sender_username, decision, history_text, delivery_note=""):
     action = decision.get("action", "manual_review")
     title = "🔥 ТЕПЛЫЙ ЛИД" if action == "handoff_to_manager" else "⚠️ РУЧНАЯ ПРОВЕРКА"
     last_message = get_last_client_message(history_text) or "<не удалось выделить последнюю реплику>"
     confidence = clamp_confidence(decision.get("confidence"))
+    note_block = f"{delivery_note}\n\n" if delivery_note else ""
     return (
         f"{title} @{sender_username}\n\n"
         f"Stage: {decision.get('stage', 'unknown')}\n"
         f"Action: {action}\n"
         f"Confidence: {confidence:.2f}\n"
         f"Причина: {decision.get('reason') or decision.get('action_reason') or 'нет причины'}\n\n"
+        f"{note_block}"
         f"Последняя реплика клиента:\n{last_message}\n\n"
         f"История переписки:\n\n{history_text}"
     )
 
-async def process_private_reply(client, chat_id, sender_username, target_key):
+async def handle_private_reply(client, chat_id, sender_username, target_key):
+    async with db_lock:
+        db = load_db()
+        contact = db["contacted"].get(target_key)
+        if contact is None:
+            return
+        status = contact.get("status")
+        if status in TERMINAL_STATUSES:
+            logger.info(f"Skipping auto-reply for {sender_username}: terminal status {status}")
+            return
+
+        today = str(datetime.date.today())
+        if contact.get("last_reply_date") != today:
+            contact["last_reply_date"] = today
+            contact["reply_count"] = 0
+            save_db(db)
+        current_reply_count = contact.get("reply_count", 0)
+        last_notified_action = contact.get("last_notified_action")
+
+    try:
+        await client.send_read_acknowledge(chat_id)
+    except Exception:
+        pass
+
+    try:
+        history_text = await get_history_text(client, chat_id, sender_username, limit=14)
+    except Exception as e:
+        logger.error(f"Failed to fetch history for {sender_username}: {e}")
+        history_text = f"Клиент (@{sender_username}): <не удалось загрузить историю>"
+
+    async with client.action(chat_id, 'typing'):
+        decision = await asyncio.to_thread(generate_conversational_reply, history_text)
+
+    if not decision or "reply_text" not in decision:
+        logger.error(f"Failed to build reply decision for {sender_username}")
+        return
+
+    action = decision.get("action", "manual_review")
+    stage = decision.get("stage", "unknown")
+    reply_text = str(decision.get("reply_text") or "")
+
+    # The daily reply cap limits only ordinary replies. Handoff, stop and manual
+    # review are always processed, otherwise an agreeing lead is silently dropped.
+    if action == "send_reply" and current_reply_count >= REPLY_DAILY_CAP:
+        logger.info(f"Daily reply cap reached for {sender_username}; staying silent until tomorrow.")
+        return
+
+    reply_sent = False
+    reply_error = None
+    if reply_text.strip():
+        try:
+            await client.send_message(chat_id, reply_text)
+            reply_sent = True
+            logger.info(f"Auto-replied to {sender_username}")
+        except errors.FloodWaitError as e:
+            seconds = int(getattr(e, "seconds", 0) or 0)
+            reply_error = f"FloodWait {seconds}s"
+            logger.error(f"FloodWait when replying to {sender_username}: {seconds}s")
+            await activate_cooldown(seconds + FLOOD_WAIT_EXTRA_SECONDS, f"FloodWait while replying to @{sender_username}")
+        except Exception as e:
+            reply_error = str(e)
+            logger.error(f"Error replying to {sender_username}: {e}")
+    else:
+        logger.info(f"AI action for {sender_username} has no client reply: {action}")
+
+    if action == "send_reply" and not reply_sent:
+        # Nothing was delivered and nothing needs escalation; the next incoming
+        # message will retry with fresh history.
+        return
+
+    # A failed client reply must never cancel the handoff itself: the manager is
+    # notified anyway and asked to write to the lead personally.
+    delivery_note = ""
+    if action == "handoff_to_manager" and not reply_sent:
+        delivery_note = (
+            f"⚠️ Ответ клиенту НЕ доставлен ({reply_error or 'ошибка отправки'}). "
+            f"Напишите клиенту сами: \"{reply_text}\""
+        )
+
+    # Deduplicate by notification kind, not by a single "already notified" flag:
+    # a manual_review ping must not swallow a later warm handoff notification.
+    should_notify = bool(decision.get("notify_manager")) and last_notified_action != action
+
+    notification_text = None
+    if should_notify:
+        notification_history = history_text
+        try:
+            notification_history = await get_history_text(client, chat_id, sender_username, limit=30) or history_text
+        except Exception as e:
+            logger.error(f"Failed to fetch extended history for {sender_username}: {e}")
+        notification_text = manager_notification_text(sender_username, decision, notification_history, delivery_note)
+
+    async with db_lock:
+        db = load_db()
+        contact = db["contacted"].get(target_key)
+        if contact is not None:
+            contact["last_stage"] = stage
+            contact["last_action"] = action
+            new_status = decision.get("status")
+            if new_status:
+                contact["status"] = new_status
+            if action == "send_reply" and reply_sent:
+                contact["reply_count"] = contact.get("reply_count", 0) + 1
+            if action == "silent_stop":
+                contact["stop_reason"] = decision.get("reason") or decision.get("action_reason")
+            if should_notify:
+                contact["last_notified_action"] = action
+                contact["manager_notified_at"] = time.time()
+        if notification_text:
+            queue_admin_notification(db, notification_text)
+        save_db(db)
+
+    if notification_text:
+        await flush_admin_notifications(client)
+        logger.info(f"Queued admin notification about {action} for {sender_username}")
+
+async def process_private_reply(client, chat_id, sender_username, target_key, task_state=None):
     try:
         await asyncio.sleep(INCOMING_REPLY_DEBOUNCE_SECONDS)
+        if task_state is not None:
+            # From this point on the task must not be cancelled by a newer message:
+            # aborting between "reply sent" and "manager notified" loses the lead.
+            task_state["processing"] = True
 
-        async with db_lock:
-            db = load_db()
-            if target_key not in db["contacted"]:
-                return
-
-            user_data = db["contacted"][target_key]
-            if user_data.get("status") in TERMINAL_STATUSES:
-                logger.info(
-                    f"Skipping auto-reply for {sender_username}: terminal status {user_data.get('status')}"
-                )
-                return
-
-            today = str(datetime.date.today())
-            if user_data.get("last_reply_date") != today:
-                user_data["last_reply_date"] = today
-                user_data["reply_count"] = 0
-                save_db(db)
-
-            current_reply_count = user_data.get("reply_count", 0)
-
-        if current_reply_count >= 10:
-            return
-
-        try:
-            await client.send_read_acknowledge(chat_id)
-        except Exception:
-            pass
-
-        try:
-            history_text = await get_history_text(client, chat_id, sender_username, limit=14)
-        except Exception as e:
-            logger.error(f"Failed to fetch history for {sender_username}: {e}")
-            history_text = f"Клиент (@{sender_username}): <не удалось загрузить историю>"
-
-        async with client.action(chat_id, 'typing'):
-            ai_response = await asyncio.to_thread(generate_conversational_reply, history_text)
-
-        if ai_response is None or "reply_text" not in ai_response:
-            logger.error(f"Failed to generate JSON reply for {sender_username}")
-            return
-
-        reply_text = str(ai_response.get("reply_text") or "")
-        action = ai_response.get("action", "send_reply")
-        status = ai_response.get("status")
-        should_notify_manager = bool(ai_response.get("notify_manager"))
-        notification_history = history_text
-
-        if reply_text.strip():
-            try:
-                await client.send_message(chat_id, reply_text)
-            except errors.FloodWaitError as e:
-                logger.error(f"FloodWait when replying to {sender_username}: {e.seconds}s")
-                return
-            except Exception as e:
-                logger.error(f"Error replying to {sender_username}: {e}")
-                return
-            logger.info(f"Auto-replied to {sender_username}")
-        else:
-            logger.info(f"AI action for {sender_username} has no client reply: {action}")
-
-        async with db_lock:
-            db = load_db()
-            already_notified = False
-            if target_key in db["contacted"]:
-                user_data = db["contacted"][target_key]
-                already_notified = bool(user_data.get("manager_notified_at"))
-                user_data["last_stage"] = ai_response.get("stage")
-                user_data["last_action"] = action
-                if status:
-                    user_data["status"] = status
-                if action in {"handoff_to_manager", "silent_stop", "manual_review"}:
-                    user_data["reply_count"] = 999
-                elif reply_text.strip():
-                    user_data["reply_count"] = user_data.get("reply_count", 0) + 1
-                if action == "silent_stop":
-                    user_data["stop_reason"] = ai_response.get("reason") or ai_response.get("action_reason")
-                save_db(db)
-
-        if should_notify_manager and not already_notified:
-            try:
-                warm_history = await get_history_text(client, chat_id, sender_username, limit=30)
-                notification_history = warm_history or notification_history
-                manager_msg = manager_notification_text(sender_username, ai_response, notification_history)
-                await notify_admin(client, manager_msg)
-                async with db_lock:
-                    db = load_db()
-                    if target_key in db["contacted"]:
-                        db["contacted"][target_key]["manager_notified_at"] = time.time()
-                        db["contacted"][target_key]["status"] = status or db["contacted"][target_key].get("status")
-                        save_db(db)
-                logger.info(f"Notified admin group about {action} for {sender_username}")
-            except Exception as e:
-                logger.error(f"Failed to notify admin group about warm lead {sender_username}: {e}")
+        reply_lock = reply_locks.setdefault(target_key, asyncio.Lock())
+        async with reply_lock:
+            await handle_private_reply(client, chat_id, sender_username, target_key)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.error(f"Private reply task failed for {sender_username}: {e}")
     finally:
-        current_task = asyncio.current_task()
-        if pending_reply_tasks.get(target_key) is current_task:
+        if task_state is not None and pending_reply_tasks.get(target_key) is task_state:
             pending_reply_tasks.pop(target_key, None)
 
 async def main():
-    global cooldown_until, pending_leads
-    
     if not API_ID or not API_HASH or not SESSION:
         logger.error("Missing critical MTProto credentials (API_ID, API_HASH, SESSION) in .env file.")
         return
-        
+
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH, proxy=PROXY)
-    
+
     @client.on(events.NewMessage(chats=TARGET_CHAT))
     async def handler(event):
-        global cooldown_until, pending_leads
         text = event.raw_text
         target_user = extract_target_username(text)
         if not target_user:
             logger.warning("Could not extract target username from lead header. Skipping lead.")
             return
 
-        target_key = str(target_user)
-        
-        async with db_lock:
-            db = load_db()
-            if not can_message_today(db):
-                logger.info("Daily limit reached. Skipping lead.")
-                return
-            if target_key in db["contacted"]:
-                logger.info(f"Already contacted {target_user}. Skipping.")
-                status = db["contacted"][target_key].get("status") or "sent"
-                await notify_skipped_lead(client, target_user, f"уже обработан ранее, статус {status}")
-                return
-
-        context_match = re.search(r'📄\s*Оригинал\n+(.*)', text, re.DOTALL)
-        if context_match:
-            lead_context = context_match.group(1).strip()
-        else:
-            lead_context = text
-
-        if target_key in pending_leads:
+        dedupe_key = normalize_key(target_user)
+        if dedupe_key in pending_leads:
             return
-        pending_leads.add(target_key)
-        
+        pending_leads.add(dedupe_key)
+
+        record_key = str(target_user)
         pitch_message = None
+        passed_dedupe = False
         try:
+            async with db_lock:
+                db = load_db()
+                existing_key = find_contact_key(db, target_user)
+                existing_status = db["contacted"][existing_key].get("status") if existing_key else None
+                limit_reached = not can_message_today(db)
+            if existing_key:
+                record_key = existing_key
+
+            # missed_limit leads may be re-pitched when they show up again.
+            if existing_status and existing_status != "missed_limit":
+                logger.info(f"Already contacted {target_user} (status {existing_status}). Skipping.")
+                return
+            passed_dedupe = True
+
+            lead_context = lead_context_from_text(text)
+
+            if limit_reached:
+                logger.info(f"Daily limit reached; reporting lead @{target_user} instead of dropping it.")
+                await mark_missed_limit(client, record_key, target_user, lead_context)
+                return
+
+            pitch_message = await build_pitch_message(target_user, lead_context)
+            if pitch_message == "SKIP":
+                logger.info(f"Skipped lead @{target_user}: AI решил SKIP.")
+                await mark_lead_processed(record_key, "skipped")
+                return
+
             cooldown_remaining = await get_cooldown_remaining()
             if cooldown_remaining > 0:
-                pitch_message = await build_pitch_message(target_user, lead_context)
-                if pitch_message == "SKIP":
-                    await notify_skipped_lead(client, target_user, "AI решил SKIP")
-                    await mark_lead_processed(target_user, "skipped")
-                    return
-                await notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining)
+                await park_lead_for_manual(
+                    client, record_key, target_user, pitch_message,
+                    f"Кулдаун Telegram еще ~{cooldown_remaining // 60} мин",
+                )
                 return
 
             delay = random.randint(SEND_DELAY_MIN_SECONDS, SEND_DELAY_MAX_SECONDS)
             logger.info(f"Sleeping for {delay}s before pitching {target_user}...")
             await asyncio.sleep(delay)
-            
-            cooldown_remaining = await get_cooldown_remaining()
-            if cooldown_remaining > 0:
-                pitch_message = await build_pitch_message(target_user, lead_context)
-                if pitch_message == "SKIP":
-                    await notify_skipped_lead(client, target_user, "AI решил SKIP")
-                    await mark_lead_processed(target_user, "skipped")
-                    return
-                await notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining)
-                return
-
-            pitch_message = await build_pitch_message(target_user, lead_context)
-            if pitch_message == "SKIP":
-                await notify_skipped_lead(client, target_user, "AI решил SKIP")
-                await mark_lead_processed(target_user, "skipped")
-                return
 
             async with outbound_lock:
                 cooldown_remaining = await get_cooldown_remaining()
                 if cooldown_remaining > 0:
-                    await notify_manual_due_to_cooldown(client, target_user, pitch_message, cooldown_remaining)
+                    await park_lead_for_manual(
+                        client, record_key, target_user, pitch_message,
+                        f"Кулдаун Telegram еще ~{cooldown_remaining // 60} мин",
+                    )
+                    return
+
+                # Re-check the daily limit at send time: several leads may have been
+                # sleeping concurrently and the limit could be spent by now.
+                async with db_lock:
+                    db = load_db()
+                    limit_reached = not can_message_today(db)
+                if limit_reached:
+                    await mark_missed_limit(client, record_key, target_user, lead_context)
                     return
 
                 await client.send_message(target_user, pitch_message)
-            
-            await mark_lead_processed(target_user, "sent")
-                
+
+            await mark_lead_processed(record_key, "sent")
             logger.info(f"Successfully pitched {target_user}")
-            
+
         except errors.FloodWaitError as e:
-            logger.error(f"Flood wait error. Must wait {e.seconds} seconds.")
-            cooldown_seconds = e.seconds + FLOOD_WAIT_EXTRA_SECONDS
-            await activate_cooldown(cooldown_seconds, f"FloodWait while pitching @{target_user}")
-            if pitch_message:
-                await mark_lead_processed(target_user, "manual_required")
+            seconds = int(getattr(e, "seconds", 0) or 0)
+            logger.error(f"Flood wait error. Must wait {seconds} seconds.")
+            await activate_cooldown(seconds + FLOOD_WAIT_EXTRA_SECONDS, f"FloodWait while pitching @{target_user}")
+            if passed_dedupe:
+                await park_lead_for_manual(client, record_key, target_user, pitch_message, "FloodWait при отправке питча")
         except Exception as e:
             error_text = str(e)
+            logger.error(f"Failed to send pitch to {target_user}: {error_text}")
             if "Too many requests" in error_text or "A wait of" in error_text:
-                logger.error(f"Failed to send pitch to {target_user}: {error_text}")
                 await activate_cooldown(GENERIC_LIMIT_COOLDOWN_SECONDS, f"Telegram limit while pitching @{target_user}: {error_text}")
-                if pitch_message:
-                    await mark_lead_processed(target_user, "manual_required")
-            else:
-                logger.error(f"Failed to send pitch to {target_user}: {e}")
-                if pitch_message:
-                    await mark_lead_processed(target_user, "manual_required")
+            if passed_dedupe:
+                await park_lead_for_manual(client, record_key, target_user, pitch_message, "Ошибка при отправке питча")
         finally:
-            pending_leads.discard(target_key)
+            pending_leads.discard(dedupe_key)
 
     @client.on(events.NewMessage(incoming=True))
     async def pm_handler(event):
@@ -806,30 +956,46 @@ async def main():
             return
 
         sender = await event.get_sender()
-        sender_id = str(sender.id) if sender else ""
-        sender_username = sender.username if sender and sender.username else sender_id
+        if sender is None:
+            return
+        sender_id = str(sender.id)
+        sender_username = sender.username or sender_id
 
+        # Case-insensitive lookup: the lead header and the actual Telegram username
+        # may differ in case, and that mismatch used to make the bot ignore replies.
         async with db_lock:
             db = load_db()
-            contacted_ids = [str(k) for k in db["contacted"].keys()]
-
-        if sender_username not in contacted_ids and sender_id not in contacted_ids:
+            target_key = find_contact_key(db, sender_username, sender_id)
+        if not target_key:
             return
 
-        target_key = sender_username if sender_username in contacted_ids else sender_id
         logger.info(f"Queued reply from {sender_username}: {event.raw_text}")
 
-        existing_task = pending_reply_tasks.get(target_key)
-        if existing_task and not existing_task.done():
-            existing_task.cancel()
+        state = pending_reply_tasks.get(target_key)
+        if state and not state["task"].done() and not state.get("processing"):
+            # Still debouncing - restart the timer so the reply covers the newest message.
+            state["task"].cancel()
 
-        pending_reply_tasks[target_key] = asyncio.create_task(
-            process_private_reply(client, event.chat_id, sender_username, target_key)
+        task_state = {"processing": False, "task": None}
+        task_state["task"] = asyncio.create_task(
+            process_private_reply(client, event.chat_id, sender_username, target_key, task_state)
         )
+        pending_reply_tasks[target_key] = task_state
 
     await client.start()
     logger.info("MTProto Lead Skill started. Listening for leads...")
-    await client.run_until_disconnected()
+
+    # Deliver anything left in the outbox from a previous run before going live.
+    try:
+        await flush_admin_notifications(client)
+    except Exception as e:
+        logger.error(f"Startup notification flush failed: {e}")
+    notification_worker = asyncio.create_task(admin_notification_worker(client))
+
+    try:
+        await client.run_until_disconnected()
+    finally:
+        notification_worker.cancel()
 
 if __name__ == '__main__':
     asyncio.run(main())
