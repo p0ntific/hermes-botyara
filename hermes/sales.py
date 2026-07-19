@@ -35,11 +35,11 @@ SEND_REPLY_STAGES = {
     "qualification_needed",
     "objection_without_commitment",
 }
-TERMINAL_STATUSES = {"notification_pending", "warm_notified", "stopped", "manual_review"}
+TERMINAL_STATUSES = {"notification_pending", "warm_notified", "stopped"}
 LOW_CONFIDENCE_THRESHOLD = 0.55
 
 EXPLICIT_NEGATIVE_RE = re.compile(
-    r"("
+    r"(?<![а-яёa-z0-9])("
     r"не\s+(?:интересно|актуально|надо|нужно)"
     r"|не\s+рассматриваем"
     r"|не\s+пишите"
@@ -47,24 +47,17 @@ EXPLICIT_NEGATIVE_RE = re.compile(
     r"|отказываюсь"
     r"|удалите"
     r"|стоп"
-    r")",
+    r")(?![а-яёa-z0-9])",
     re.IGNORECASE,
 )
+EXPLICIT_NEGATIVE_MAX_CHARS = 80
 
 QUESTION_BEFORE_HANDOFF_RE = re.compile(
     r"("
     r"\?"
     r"|правильно\s+понял"
     r"|верно\s+понял"
-    r"|сколько"
-    r"|стоим"
-    r"|цен"
-    r"|бесплат"
-    r"|сообщени"
-    r"|провер"
-    r"|как\s+это"
-    r"|как\s+работ"
-    r"|что\s+входит"
+    r"|(?:^|\s)(?:сколько|как|что|где|когда|почему|зачем|какой|какая|какие)\b"
     r")",
     re.IGNORECASE,
 )
@@ -145,7 +138,11 @@ def normalize_stage(stage):
 
 def stage_from_explicit_negative(history_text):
     last_message = get_last_client_message(history_text)
-    if last_message and EXPLICIT_NEGATIVE_RE.search(last_message):
+    if not last_message:
+        return None
+    if len(last_message) > EXPLICIT_NEGATIVE_MAX_CHARS or "?" in last_message:
+        return None
+    if EXPLICIT_NEGATIVE_RE.search(last_message):
         return {
             "stage": "not_interested",
             "reason": "клиент явно отказался или попросил не писать",
@@ -319,11 +316,7 @@ class SalesBrain:
 
     # --- conversation ----------------------------------------------------
 
-    def classify_conversation_stage(self, history_text, lead_key=None):
-        explicit_negative = stage_from_explicit_negative(history_text)
-        if explicit_negative:
-            return explicit_negative
-
+    def _query_stage_classifier(self, history_text, lead_key=None):
         try:
             result = self.router.chat(
                 "classify",
@@ -348,6 +341,27 @@ class SalesBrain:
             "confidence": clamp_confidence(parsed.get("confidence")),
             "model": f"{result.provider}:{result.model}",
         }
+
+    def classify_conversation_stage(self, history_text, lead_key=None):
+        explicit_negative = stage_from_explicit_negative(history_text)
+        if explicit_negative:
+            return explicit_negative
+
+        first = self._query_stage_classifier(history_text, lead_key=lead_key)
+        if (
+            first["stage"] != "unknown"
+            and first["confidence"] >= LOW_CONFIDENCE_THRESHOLD
+        ):
+            return first
+
+        retry = self._query_stage_classifier(history_text, lead_key=lead_key)
+        return max(
+            (first, retry),
+            key=lambda item: (
+                item["stage"] != "unknown",
+                item["confidence"],
+            ),
+        )
 
     def fallback_reply_for_stage(self, stage, manager_username=None):
         manager_username = manager_username or self.settings.manager_username
@@ -459,13 +473,20 @@ def manual_message_notice(target_user, message_text):
     return f"Напишите вручную @{target_user}: \"{message_text}\""
 
 
-def manager_notification_text(sender_username, decision, history_text, account=None):
+def manager_notification_text(
+    sender_username,
+    decision,
+    history_text,
+    account=None,
+    delivery_note="",
+):
     action = decision.get("action", "manual_review")
     title = "🔥 ТЕПЛЫЙ ЛИД" if action == "handoff_to_manager" else "⚠️ РУЧНАЯ ПРОВЕРКА"
     last_message = get_last_client_message(history_text) or "<не удалось выделить последнюю реплику>"
     confidence = clamp_confidence(decision.get("confidence"))
     account_line = f"Аккаунт: {account}\n" if account else ""
     model_line = f"Модель: {decision['model']}\n" if decision.get("model") else ""
+    note_block = f"{delivery_note}\n\n" if delivery_note else ""
     return (
         f"{title} @{sender_username}\n\n"
         f"{account_line}"
@@ -474,6 +495,7 @@ def manager_notification_text(sender_username, decision, history_text, account=N
         f"Confidence: {confidence:.2f}\n"
         f"{model_line}"
         f"Причина: {decision.get('reason') or decision.get('action_reason') or 'нет причины'}\n\n"
+        f"{note_block}"
         f"Последняя реплика клиента:\n{last_message}\n\n"
         f"История переписки:\n\n{history_text}"
     )

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS leads (
     last_stage TEXT,
     last_action TEXT,
     manager_notified_at REAL,
+    last_notified_action TEXT,
     stop_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS queue (
@@ -68,15 +69,19 @@ CREATE TABLE IF NOT EXISTS account_control (
     daily_limit INTEGER
 );
 CREATE TABLE IF NOT EXISTS admin_notifications (
-    lead_key TEXT PRIMARY KEY,
+    lead_key TEXT NOT NULL,
     account TEXT,
     recipient TEXT,
+    action TEXT NOT NULL,
     message TEXT NOT NULL,
     target_status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    claimed_at REAL,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (lead_key, action)
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -114,6 +119,19 @@ class Store:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._ensure_column("leads", "last_notified_action", "TEXT")
+            self._conn.execute(
+                """UPDATE leads
+                   SET last_notified_action=last_action
+                   WHERE manager_notified_at IS NOT NULL
+                     AND last_notified_action IS NULL
+                     AND last_action IN ('manual_review', 'handoff_to_manager')"""
+            )
+            self._conn.execute(
+                """UPDATE leads SET reply_count=0
+                   WHERE status='manual_review' AND reply_count>=999"""
+            )
+            self._migrate_admin_notifications_schema()
             self._conn.commit()
 
     def close(self):
@@ -121,6 +139,75 @@ class Store:
             self._conn.close()
 
     # --- migration -------------------------------------------------------
+
+    def _ensure_column(self, table, column, declaration):
+        columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            )
+
+    def _migrate_admin_notifications_schema(self):
+        columns = self._conn.execute(
+            "PRAGMA table_info(admin_notifications)"
+        ).fetchall()
+        names = {row["name"] for row in columns}
+        primary_key = [
+            row["name"]
+            for row in sorted(columns, key=lambda row: row["pk"])
+            if row["pk"]
+        ]
+        if (
+            primary_key == ["lead_key", "action"]
+            and "claimed_at" in names
+            and "next_attempt_at" in names
+        ):
+            return
+
+        action_expr = (
+            "COALESCE(n.action, l.last_action, "
+            "CASE WHEN n.target_status='warm_notified' "
+            "THEN 'handoff_to_manager' ELSE 'manual_review' END)"
+            if "action" in names
+            else
+            "COALESCE(l.last_action, "
+            "CASE WHEN n.target_status='warm_notified' "
+            "THEN 'handoff_to_manager' ELSE 'manual_review' END)"
+        )
+        self._conn.execute(
+            "ALTER TABLE admin_notifications RENAME TO admin_notifications_legacy"
+        )
+        self._conn.execute(
+            """CREATE TABLE admin_notifications (
+                   lead_key TEXT NOT NULL,
+                   account TEXT,
+                   recipient TEXT,
+                   action TEXT NOT NULL,
+                   message TEXT NOT NULL,
+                   target_status TEXT NOT NULL,
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   last_error TEXT,
+                   claimed_at REAL,
+                   next_attempt_at REAL NOT NULL DEFAULT 0,
+                   created_at REAL NOT NULL,
+                   updated_at REAL NOT NULL,
+                   PRIMARY KEY (lead_key, action)
+               )"""
+        )
+        self._conn.execute(
+            f"""INSERT OR IGNORE INTO admin_notifications
+                    (lead_key, account, recipient, action, message,
+                     target_status, attempts, last_error, created_at, updated_at)
+                SELECT n.lead_key, n.account, n.recipient, {action_expr},
+                       n.message, n.target_status, n.attempts, n.last_error,
+                       n.created_at, n.updated_at
+                FROM admin_notifications_legacy n
+                LEFT JOIN leads l ON l.lead_key=n.lead_key"""
+        )
+        self._conn.execute("DROP TABLE admin_notifications_legacy")
 
     def migrate_legacy_json(self, json_path, account_names):
         if not json_path or not os.path.exists(json_path):
@@ -255,70 +342,200 @@ class Store:
     def apply_decision(self, lead_key, decision, replied):
         """Mirror of the legacy post-reply bookkeeping."""
         lead_key = _lead_key(lead_key)
+        with self._lock:
+            already_notified = self._apply_decision_locked(
+                lead_key,
+                decision,
+                replied,
+            )
+            self._conn.commit()
+            return already_notified
+
+    def _apply_decision_locked(self, lead_key, decision, replied):
         action = decision.get("action")
         status = decision.get("status")
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT reply_count, manager_notified_at FROM leads WHERE lead_key=?",
-                (lead_key,),
-            ).fetchone()
-            if row is None:
-                return False
-            reply_count = int(row["reply_count"] or 0)
-            if action in {"handoff_to_manager", "silent_stop", "manual_review"}:
-                reply_count = 999
-            elif replied:
-                reply_count += 1
-            stop_reason = None
-            if action == "silent_stop":
-                stop_reason = decision.get("reason") or decision.get("action_reason")
-            self._conn.execute(
-                """UPDATE leads SET last_stage=?, last_action=?, reply_count=?,
-                       status=COALESCE(?, status),
-                       stop_reason=COALESCE(?, stop_reason)
-                   WHERE lead_key=?""",
-                (
-                    decision.get("stage"),
-                    action,
-                    reply_count,
-                    status,
-                    stop_reason,
-                    lead_key,
-                ),
-            )
-            self._conn.commit()
-            return bool(row["manager_notified_at"])
-
-    def mark_manager_notified(self, lead_key, status=None):
-        lead_key = _lead_key(lead_key)
-        with self._lock:
-            self._conn.execute(
-                "UPDATE leads SET manager_notified_at=?, status=COALESCE(?, status) WHERE lead_key=?",
-                (time.time(), status, lead_key),
-            )
-            self._conn.commit()
+        row = self._conn.execute(
+            """SELECT reply_count, manager_notified_at, last_notified_action
+               FROM leads WHERE lead_key=?""",
+            (lead_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        reply_count = int(row["reply_count"] or 0)
+        if action == "send_reply" and replied:
+            reply_count += 1
+        stop_reason = None
+        if action == "silent_stop":
+            stop_reason = decision.get("reason") or decision.get("action_reason")
+        self._conn.execute(
+            """UPDATE leads SET last_stage=?, last_action=?, reply_count=?,
+                   status=COALESCE(?, status),
+                   stop_reason=COALESCE(?, stop_reason)
+               WHERE lead_key=?""",
+            (
+                decision.get("stage"),
+                action,
+                reply_count,
+                status,
+                stop_reason,
+                lead_key,
+            ),
+        )
+        return bool(
+            row["manager_notified_at"]
+            and row["last_notified_action"] == action
+        )
 
     # --- durable admin notification outbox ------------------------------
 
     def enqueue_admin_notification(
-        self, lead_key, account, recipient, message, target_status
+        self, lead_key, account, recipient, action, message, target_status
     ):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._enqueue_admin_notification_locked(
+                lead_key,
+                account,
+                recipient,
+                action,
+                message,
+                target_status,
+            )
+            self._conn.commit()
+
+    def _enqueue_admin_notification_locked(
+        self,
+        lead_key,
+        account,
+        recipient,
+        action,
+        message,
+        target_status,
+    ):
+        now = time.time()
+        self._conn.execute(
+            """INSERT INTO admin_notifications
+                   (lead_key, account, recipient, action, message,
+                    target_status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(lead_key, action) DO NOTHING""",
+            (
+                lead_key,
+                account,
+                recipient,
+                action,
+                message,
+                target_status,
+                now,
+                now,
+            ),
+        )
+
+    def apply_decision_and_enqueue_notification(
+        self,
+        lead_key,
+        decision,
+        account,
+        recipient,
+        message,
+        target_status,
+    ):
+        """Persist the decision and its notification intent in one transaction."""
+        lead_key = _lead_key(lead_key)
+        action = decision.get("action")
+        with self._lock:
+            already_notified = self._apply_decision_locked(
+                lead_key,
+                decision,
+                replied=False,
+            )
+            if not already_notified:
+                self._enqueue_admin_notification_locked(
+                    lead_key,
+                    account,
+                    recipient,
+                    action,
+                    message,
+                    target_status,
+                )
+            self._conn.commit()
+            return already_notified
+
+    def update_admin_notification_message(
+        self,
+        lead_key,
+        action,
+        message,
+    ):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE admin_notifications SET message=?, updated_at=?
+                   WHERE lead_key=? AND action=?""",
+                (message, time.time(), lead_key, action),
+            )
+            self._conn.commit()
+
+    def claim_admin_notification(self, lead_key, action, stale_seconds=300):
         lead_key = _lead_key(lead_key)
         now = time.time()
         with self._lock:
-            self._conn.execute(
-                """INSERT INTO admin_notifications
-                       (lead_key, account, recipient, message, target_status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(lead_key) DO UPDATE SET
-                       account=excluded.account,
-                       recipient=excluded.recipient,
-                       message=excluded.message,
-                       target_status=excluded.target_status,
-                       updated_at=excluded.updated_at""",
-                (lead_key, account, recipient, message, target_status, now, now),
+            cur = self._conn.execute(
+                """UPDATE admin_notifications
+                   SET claimed_at=?, updated_at=?
+                   WHERE lead_key=? AND action=?
+                     AND next_attempt_at<=?
+                     AND (claimed_at IS NULL OR claimed_at<=?)""",
+                (
+                    now,
+                    now,
+                    lead_key,
+                    action,
+                    now,
+                    now - stale_seconds,
+                ),
             )
             self._conn.commit()
+            return cur.rowcount > 0
+
+    def claim_pending_admin_notifications(
+        self,
+        limit=20,
+        stale_seconds=300,
+    ):
+        now = time.time()
+        cutoff = now - stale_seconds
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM admin_notifications
+                   WHERE next_attempt_at<=?
+                     AND (claimed_at IS NULL OR claimed_at<=?)
+                   ORDER BY created_at LIMIT ?""",
+                (now, cutoff, limit),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                cur = self._conn.execute(
+                    """UPDATE admin_notifications
+                       SET claimed_at=?, updated_at=?
+                       WHERE lead_key=? AND action=?
+                         AND next_attempt_at<=?
+                         AND (claimed_at IS NULL OR claimed_at<=?)""",
+                    (
+                        now,
+                        now,
+                        row["lead_key"],
+                        row["action"],
+                        now,
+                        cutoff,
+                    ),
+                )
+                if cur.rowcount:
+                    item = dict(row)
+                    item["claimed_at"] = now
+                    claimed.append(item)
+            self._conn.commit()
+            return claimed
 
     def pending_admin_notifications(self, limit=20):
         with self._lock:
@@ -328,34 +545,91 @@ class Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def fail_admin_notification(self, lead_key, error):
-        lead_key = _lead_key(lead_key)
+    def orphaned_notification_pending(self):
         with self._lock:
-            self._conn.execute(
-                """UPDATE admin_notifications
-                   SET attempts=attempts+1, last_error=?, updated_at=?
-                   WHERE lead_key=?""",
-                (str(error)[:500], time.time(), lead_key),
-            )
-            self._conn.commit()
+            rows = self._conn.execute(
+                """SELECT l.* FROM leads l
+                   WHERE l.status='notification_pending'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM admin_notifications n
+                         WHERE n.lead_key=l.lead_key
+                           AND n.action='handoff_to_manager'
+                     )
+                   ORDER BY l.timestamp"""
+            ).fetchall()
+            return [dict(row) for row in rows]
 
-    def complete_admin_notification(self, lead_key):
+    def fail_admin_notification(self, lead_key, action, error):
         lead_key = _lead_key(lead_key)
         with self._lock:
             row = self._conn.execute(
-                "SELECT target_status FROM admin_notifications WHERE lead_key=?",
-                (lead_key,),
+                """SELECT attempts FROM admin_notifications
+                   WHERE lead_key=? AND action=?""",
+                (lead_key, action),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"] or 0) + 1
+            retry_delay = min(3600, 60 * (2 ** min(attempts - 1, 6)))
+            now = time.time()
+            self._conn.execute(
+                """UPDATE admin_notifications
+                   SET attempts=?, last_error=?, claimed_at=NULL,
+                       next_attempt_at=?, updated_at=?
+                   WHERE lead_key=? AND action=?""",
+                (
+                    attempts,
+                    str(error)[:500],
+                    now + retry_delay,
+                    now,
+                    lead_key,
+                    action,
+                ),
+            )
+            self._conn.commit()
+
+    def complete_admin_notification(self, lead_key, action):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT target_status, action FROM admin_notifications
+                   WHERE lead_key=? AND action=?""",
+                (lead_key, action),
             ).fetchone()
             if row is None:
                 return False
             now = time.time()
             self._conn.execute(
-                "UPDATE leads SET manager_notified_at=?, status=? WHERE lead_key=?",
-                (now, row["target_status"], lead_key),
+                """UPDATE leads
+                   SET manager_notified_at=?,
+                       last_notified_action=CASE
+                           WHEN ?='handoff_to_manager'
+                             OR last_notified_action!='handoff_to_manager'
+                             OR last_notified_action IS NULL
+                           THEN ?
+                           ELSE last_notified_action
+                       END,
+                       status=CASE
+                           WHEN ?='handoff_to_manager' THEN ?
+                           WHEN status IN ('notification_pending', 'warm_notified')
+                           THEN status
+                           ELSE ?
+                       END
+                   WHERE lead_key=?""",
+                (
+                    now,
+                    action,
+                    action,
+                    action,
+                    row["target_status"],
+                    row["target_status"],
+                    lead_key,
+                ),
             )
             self._conn.execute(
-                "DELETE FROM admin_notifications WHERE lead_key=?",
-                (lead_key,),
+                """DELETE FROM admin_notifications
+                   WHERE lead_key=? AND action=?""",
+                (lead_key, action),
             )
             self._conn.commit()
             return True

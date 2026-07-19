@@ -15,7 +15,49 @@ logger = logging.getLogger(__name__)
 
 SUPERVISOR_BACKOFF_START = 15
 SUPERVISOR_BACKOFF_MAX = 600
-NOTIFICATION_RETRY_SECONDS = 60
+
+
+def recover_orphaned_notifications(store, accounts, default_manager):
+    """Recreate handoff outbox rows left by a crash from an older build."""
+    managers = {
+        account.name: account.manager_username or default_manager
+        for account in accounts
+    }
+    recovered = 0
+    for lead in store.orphaned_notification_pending():
+        lead_key = lead["lead_key"]
+        account = lead.get("account")
+        recipient = managers.get(account, default_manager)
+        transcript = store.get_transcript(lead_key, limit=30)
+        history_lines = []
+        for entry in transcript:
+            text = entry.get("text")
+            if not text:
+                continue
+            speaker = "Клиент" if entry["direction"] == "in" else "Бот"
+            history_lines.append(f"{speaker}: {text}")
+        history = "\n".join(history_lines) or "<история недоступна>"
+        message = (
+            f"🚨 ВОССТАНОВЛЕННЫЙ ТЕПЛЫЙ ЛИД @{lead_key}\n\n"
+            f"Аккаунт: {account or '-'}\n"
+            "Предыдущий процесс сохранил handoff, но не успел создать "
+            "уведомление. Проверьте диалог и свяжитесь с лидом.\n\n"
+            f"История переписки:\n{history}"
+        )
+        store.enqueue_admin_notification(
+            lead_key,
+            account,
+            recipient,
+            "handoff_to_manager",
+            message,
+            "warm_notified",
+        )
+        recovered += 1
+    if recovered:
+        logger.warning(
+            f"Recovered {recovered} orphaned handoff notification(s)"
+        )
+    return recovered
 
 
 async def supervise_worker(worker, notifier):
@@ -54,10 +96,10 @@ async def supervise_worker(worker, notifier):
         backoff = min(backoff * 2, SUPERVISOR_BACKOFF_MAX)
 
 
-async def retry_admin_notifications(store, notifier, workers):
+async def retry_admin_notifications(store, notifier, workers, retry_seconds):
     """Deliver durable outbox entries until an admin channel confirms success."""
     while True:
-        for item in store.pending_admin_notifications():
+        for item in store.claim_pending_admin_notifications():
             try:
                 preferred_client = next(
                     (
@@ -72,7 +114,10 @@ async def retry_admin_notifications(store, notifier, workers):
                     fallback_username=item.get("recipient"),
                     preferred_client=preferred_client,
                 )
-                store.complete_admin_notification(item["lead_key"])
+                store.complete_admin_notification(
+                    item["lead_key"],
+                    item["action"],
+                )
                 logger.info(
                     f"[{item['account'] or '-'}] delivered pending admin notification "
                     f"for {item['lead_key']} via {channel}"
@@ -80,12 +125,16 @@ async def retry_admin_notifications(store, notifier, workers):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                store.fail_admin_notification(item["lead_key"], e)
+                store.fail_admin_notification(
+                    item["lead_key"],
+                    item["action"],
+                    e,
+                )
                 logger.error(
                     f"[{item['account'] or '-'}] pending admin notification failed "
                     f"for {item['lead_key']}: {e}"
                 )
-        await asyncio.sleep(NOTIFICATION_RETRY_SECONDS)
+        await asyncio.sleep(retry_seconds)
 
 
 async def main():
@@ -105,6 +154,11 @@ async def main():
     store.migrate_legacy_json(settings.legacy_json_path, [a.name for a in accounts])
     for account in accounts:
         store.ensure_account(account.name)
+    recover_orphaned_notifications(
+        store,
+        accounts,
+        settings.manager_username,
+    )
     # Nothing can legitimately be mid-pitch at startup: reclaim orphaned claims.
     requeued = store.requeue_stuck(older_than_seconds=0)
     if requeued:
@@ -147,7 +201,12 @@ async def main():
     tasks.append(asyncio.create_task(dispatcher.run(), name="dispatcher"))
     tasks.append(
         asyncio.create_task(
-            retry_admin_notifications(store, notifier, workers),
+            retry_admin_notifications(
+                store,
+                notifier,
+                workers,
+                settings.notify_retry_interval_seconds,
+            ),
             name="admin-notification-retry",
         )
     )

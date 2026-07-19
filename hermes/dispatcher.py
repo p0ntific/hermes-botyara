@@ -67,7 +67,7 @@ class Dispatcher:
         if item is None:
             return False
         if item["status"] == "failed":
-            await self._give_up(item)
+            await self._give_up(item, worker)
             return True
 
         self.store.mark_dispatched(worker.name)
@@ -94,19 +94,46 @@ class Dispatcher:
             self._busy_accounts.discard(worker.name)
             self.wake.set()
 
-    async def _give_up(self, item):
+    async def _give_up(self, item, worker):
         lead_key = item["lead_key"]
         logger.error(
             f"Lead @{lead_key} exhausted {self.settings.max_pitch_attempts} pitch attempts, "
             "marking manual_required"
         )
-        self.store.add_contacted(lead_key, None, "manual_required")
+        self.store.add_contacted(lead_key, worker.name, "manual_required")
         if self.notifier:
+            notification = (
+                f"⚠️ Лид @{lead_key} не удалось обработать автоматически "
+                f"({self.settings.max_pitch_attempts} попыток). "
+                + sales.manual_message_notice(lead_key, "")
+            )
+            self.store.enqueue_admin_notification(
+                lead_key,
+                worker.name,
+                worker.cfg.manager_username,
+                "manual_required",
+                notification,
+                "manual_required",
+            )
+            if not self.store.claim_admin_notification(
+                lead_key,
+                "manual_required",
+            ):
+                return
             try:
                 await self.notifier.notify(
-                    f"⚠️ Лид @{lead_key} не удалось обработать автоматически "
-                    f"({self.settings.max_pitch_attempts} попыток). "
-                    + sales.manual_message_notice(lead_key, "")
+                    notification,
+                    fallback_username=worker.cfg.manager_username,
+                    preferred_client=worker.client,
                 )
-            except Exception:
+                self.store.complete_admin_notification(
+                    lead_key,
+                    "manual_required",
+                )
+            except Exception as e:
+                self.store.fail_admin_notification(
+                    lead_key,
+                    "manual_required",
+                    e,
+                )
                 logger.exception("Failed to notify about given-up lead")

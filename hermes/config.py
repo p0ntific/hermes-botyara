@@ -83,6 +83,8 @@ class Settings:
     generic_limit_cooldown_seconds: int
     flood_wait_extra_seconds: int
     incoming_reply_debounce_seconds: int
+    reply_daily_cap: int
+    notify_retry_interval_seconds: int
     max_pitch_attempts: int
     db_path: str
     legacy_json_path: str
@@ -104,6 +106,8 @@ def load_settings():
         generic_limit_cooldown_seconds=_int_env("GENERIC_LIMIT_COOLDOWN_SECONDS", 5 * 60 * 60),
         flood_wait_extra_seconds=_int_env("FLOOD_WAIT_EXTRA_SECONDS", 5 * 60),
         incoming_reply_debounce_seconds=_int_env("INCOMING_REPLY_DEBOUNCE_SECONDS", 20),
+        reply_daily_cap=_int_env("REPLY_DAILY_CAP", 10),
+        notify_retry_interval_seconds=_int_env("NOTIFY_RETRY_INTERVAL_SECONDS", 60),
         max_pitch_attempts=_int_env("MAX_PITCH_ATTEMPTS", 5),
         db_path=os.getenv("HERMES_DB", "hermes.db"),
         legacy_json_path=os.getenv("DB_FILE", "mtproto_leads.json"),

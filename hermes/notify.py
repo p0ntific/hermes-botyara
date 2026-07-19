@@ -5,6 +5,15 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+BOT_API_PERMANENT_ERROR_MARKERS = (
+    "401",
+    "403",
+    "404",
+    "unauthorized",
+    "forbidden",
+    "chat not found",
+)
+
 
 class AdminNotifier:
     """Admin notifications: Bot API first, then every healthy MTProto account."""
@@ -15,10 +24,16 @@ class AdminNotifier:
         self.proxy_url = proxy_url
         self.client_provider = client_provider or (lambda: None)
         self.bot_api_failed = False
-        self.mtproto_admin_failed = False
 
     async def notify(self, message, fallback_username=None, preferred_client=None):
         if not self.bot_chat_id:
+            if fallback_username:
+                await self._send_direct_via_mtproto(
+                    fallback_username,
+                    message,
+                    preferred_client=preferred_client,
+                )
+                return f"mtproto:@{fallback_username.lstrip('@')}"
             raise RuntimeError("BOT_CHAT_ID is not configured")
 
         errors = []
@@ -27,25 +42,31 @@ class AdminNotifier:
                 await asyncio.to_thread(self._send_via_bot_api, message)
                 return "bot_api"
             except Exception as e:
-                self.bot_api_failed = True
                 safe_error = str(e).replace(self.bot_token, "<token>") if self.bot_token else str(e)
                 errors.append(f"Bot API: {safe_error}")
-                logger.error(
-                    "Failed to send admin notification via Bot API; "
-                    f"disabling Bot API notifications until restart: {safe_error}"
-                )
+                if any(
+                    marker in safe_error.lower()
+                    for marker in BOT_API_PERMANENT_ERROR_MARKERS
+                ):
+                    self.bot_api_failed = True
+                    logger.error(
+                        "Bot API rejected the admin notification; disabling that "
+                        f"route until restart: {safe_error}"
+                    )
+                else:
+                    logger.warning(
+                        "Bot API notification failed transiently; falling back to "
+                        f"MTProto: {safe_error}"
+                    )
 
-        if not self.mtproto_admin_failed:
-            try:
-                await self._send_via_mtproto(message, preferred_client=preferred_client)
-                return "mtproto"
-            except Exception as e:
-                self.mtproto_admin_failed = True
-                logger.error(
-                    "Failed to send admin notification via MTProto admin chat; "
-                    f"disabling that route until restart: {e}"
-                )
-                errors.append(f"MTProto: {e}")
+        try:
+            await self._send_via_mtproto(message, preferred_client=preferred_client)
+            return "mtproto"
+        except Exception as e:
+            logger.warning(
+                f"Failed to send admin notification via MTProto admin chat: {e}"
+            )
+            errors.append(f"MTProto: {e}")
 
         if fallback_username:
             try:

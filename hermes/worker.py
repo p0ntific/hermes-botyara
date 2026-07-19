@@ -45,6 +45,8 @@ class AccountWorker:
         self.healthy = False
         self.pitch_lock = asyncio.Lock()
         self.pending_reply_tasks = {}
+        self.reply_tasks = set()
+        self.reply_locks = {}
 
     # --- lifecycle -------------------------------------------------------
 
@@ -74,7 +76,7 @@ class AccountWorker:
 
     async def stop(self):
         self.healthy = False
-        for task in list(self.pending_reply_tasks.values()):
+        for task in list(self.reply_tasks):
             task.cancel()
         if self.client:
             try:
@@ -161,6 +163,13 @@ class AccountWorker:
                 )
                 raise PitchRetryable(f"cooldown active on {self.name}")
 
+            limit = self.store.daily_limit(
+                self.name,
+                self.cfg.cold_dm_daily_limit,
+            )
+            if self.store.sent_today(self.name) >= limit:
+                raise PitchRetryable(f"daily limit reached on {self.name}")
+
             try:
                 # Persist before the network send so a crash after Telegram accepts
                 # the message cannot cause another account to cold-pitch this lead.
@@ -189,9 +198,44 @@ class AccountWorker:
                 logger.error(f"[{self.name}] failed to send pitch to @{target_user}: {e}")
                 self.store.add_contacted(target_user, self.name, "manual_required")
                 self.store.finish_queue(target_user, "failed", error=error_text[:300])
-                await self.notifier.notify(
-                    f"[{self.name}] {sales.manual_message_notice(target_user, pitch_message)}"
+                notification = (
+                    f"[{self.name}] Не удалось отправить холодный питч @{target_user}: "
+                    f"{error_text[:200]}\n"
+                    f"{sales.manual_message_notice(target_user, pitch_message)}"
                 )
+                self.store.enqueue_admin_notification(
+                    target_user,
+                    self.name,
+                    self.cfg.manager_username,
+                    "manual_required",
+                    notification,
+                    "manual_required",
+                )
+                if not self.store.claim_admin_notification(
+                    target_user,
+                    "manual_required",
+                ):
+                    return "failed"
+                try:
+                    await self.notifier.notify(
+                        notification,
+                        fallback_username=self.cfg.manager_username,
+                        preferred_client=self.client,
+                    )
+                    self.store.complete_admin_notification(
+                        target_user,
+                        "manual_required",
+                    )
+                except Exception as notify_error:
+                    self.store.fail_admin_notification(
+                        target_user,
+                        "manual_required",
+                        notify_error,
+                    )
+                    logger.error(
+                        f"[{self.name}] failed to notify about manual pitch "
+                        f"for @{target_user}: {notify_error}"
+                    )
                 return "failed"
 
             self.store.add_contacted(target_user, self.name, "sent")
@@ -231,22 +275,48 @@ class AccountWorker:
         logger.info(f"[{self.name}] queued reply from {sender_username}: {event.raw_text}")
         self.store.record_message(target_key, self.name, "in", event.raw_text)
 
-        existing_task = self.pending_reply_tasks.get(target_key)
-        if existing_task and not existing_task.done():
-            existing_task.cancel()
+        state = self.pending_reply_tasks.get(target_key)
+        if (
+            state
+            and not state["task"].done()
+            and not state.get("processing")
+        ):
+            state["task"].cancel()
 
-        self.pending_reply_tasks[target_key] = asyncio.create_task(
-            self.process_private_reply(event.chat_id, sender_username, target_key)
+        task_state = {"processing": False, "task": None}
+        task_state["task"] = asyncio.create_task(
+            self.process_private_reply(
+                event.chat_id,
+                sender_username,
+                target_key,
+                task_state=task_state,
+            )
         )
+        self.reply_tasks.add(task_state["task"])
+        task_state["task"].add_done_callback(self.reply_tasks.discard)
+        self.pending_reply_tasks[target_key] = task_state
 
     async def get_history_text(self, chat_id, sender_username, limit=20):
         messages = await self.client.get_messages(chat_id, limit=limit)
         messages.reverse()
         return sales.format_history(messages, sender_username, self.settings.product_name)
 
-    async def process_private_reply(self, chat_id, sender_username, target_key):
+    async def process_private_reply(
+        self,
+        chat_id,
+        sender_username,
+        target_key,
+        task_state=None,
+    ):
+        reply_lock = None
+        lock_acquired = False
         try:
             await asyncio.sleep(self.settings.incoming_reply_debounce_seconds)
+            if task_state is not None:
+                task_state["processing"] = True
+            reply_lock = self.reply_locks.setdefault(target_key, asyncio.Lock())
+            await reply_lock.acquire()
+            lock_acquired = True
 
             if not self.store.account_enabled(self.name):
                 return
@@ -262,8 +332,6 @@ class AccountWorker:
                 return
 
             current_reply_count = self.store.reset_reply_count_if_new_day(target_key)
-            if current_reply_count >= 10:
-                return
 
             try:
                 await self.client.send_read_acknowledge(chat_id)
@@ -294,6 +362,16 @@ class AccountWorker:
             should_notify_manager = bool(ai_response.get("notify_manager"))
             notification_history = history_text
 
+            if (
+                action == "send_reply"
+                and current_reply_count >= self.settings.reply_daily_cap
+            ):
+                logger.info(
+                    f"[{self.name}] daily reply cap reached for {sender_username}; "
+                    "staying silent until tomorrow"
+                )
+                return
+
             self.store.record_message(
                 target_key,
                 self.name,
@@ -308,29 +386,81 @@ class AccountWorker:
                 },
             )
 
+            stored_decision = ai_response
+            manager_msg = None
+            already_notified = False
+            if should_notify_manager:
+                if action == "handoff_to_manager":
+                    stored_decision = dict(ai_response)
+                    stored_decision["status"] = "notification_pending"
+                manager_msg = sales.manager_notification_text(
+                    sender_username,
+                    ai_response,
+                    notification_history,
+                    account=self.name,
+                )
+                already_notified = (
+                    self.store.apply_decision_and_enqueue_notification(
+                        target_key,
+                        stored_decision,
+                        self.name,
+                        self.cfg.manager_username,
+                        manager_msg,
+                        status or "manual_review",
+                    )
+                )
+
+            reply_sent = False
+            reply_error = None
             if reply_text.strip():
                 try:
                     await self.client.send_message(chat_id, reply_text)
+                    reply_sent = True
                 except errors.FloodWaitError as e:
-                    logger.error(f"[{self.name}] FloodWait when replying to {sender_username}: {e.seconds}s")
-                    return
+                    seconds = int(getattr(e, "seconds", 0) or 0)
+                    reply_error = f"FloodWait {seconds}s"
+                    logger.error(
+                        f"[{self.name}] FloodWait when replying to "
+                        f"{sender_username}: {seconds}s"
+                    )
+                    self.store.activate_cooldown(
+                        self.name,
+                        seconds + self.settings.flood_wait_extra_seconds,
+                        f"FloodWait while replying to @{sender_username}",
+                    )
                 except Exception as e:
+                    reply_error = str(e)
                     logger.error(f"[{self.name}] error replying to {sender_username}: {e}")
-                    return
-                self.store.record_message(target_key, self.name, "out", reply_text, meta={"kind": "reply"})
-                logger.info(f"[{self.name}] auto-replied to {sender_username}")
+                if reply_sent:
+                    self.store.record_message(
+                        target_key,
+                        self.name,
+                        "out",
+                        reply_text,
+                        meta={"kind": "reply"},
+                    )
+                    logger.info(f"[{self.name}] auto-replied to {sender_username}")
             else:
                 logger.info(f"[{self.name}] AI action for {sender_username} has no client reply: {action}")
 
-            stored_decision = ai_response
-            if should_notify_manager:
-                stored_decision = dict(ai_response)
-                stored_decision["status"] = "notification_pending"
-            already_notified = self.store.apply_decision(
-                target_key, stored_decision, replied=bool(reply_text.strip())
-            )
+            if action == "send_reply" and not reply_sent:
+                return
+
+            if not should_notify_manager:
+                self.store.apply_decision(
+                    target_key,
+                    stored_decision,
+                    replied=reply_sent,
+                )
 
             if should_notify_manager and not already_notified:
+                delivery_note = ""
+                if action == "handoff_to_manager" and not reply_sent:
+                    delivery_note = (
+                        f"⚠️ Ответ клиенту НЕ доставлен "
+                        f"({reply_error or 'ошибка отправки'}). "
+                        f"Напишите клиенту сами: \"{reply_text}\""
+                    )
                 try:
                     warm_history = await self.get_history_text(chat_id, sender_username, limit=30)
                     notification_history = warm_history or notification_history
@@ -340,25 +470,32 @@ class AccountWorker:
                         f"{sender_username}: {e}"
                     )
                 manager_msg = sales.manager_notification_text(
-                    sender_username, ai_response, notification_history, account=self.name
+                    sender_username,
+                    ai_response,
+                    notification_history,
+                    account=self.name,
+                    delivery_note=delivery_note,
                 )
-                self.store.enqueue_admin_notification(
+                self.store.update_admin_notification_message(
                     target_key,
-                    self.name,
-                    self.cfg.manager_username,
+                    action,
                     manager_msg,
-                    status or "manual_review",
                 )
+                if not self.store.claim_admin_notification(target_key, action):
+                    return
                 try:
-                    await self.notifier.notify(
+                    channel = await self.notifier.notify(
                         manager_msg,
                         fallback_username=self.cfg.manager_username,
                         preferred_client=self.client,
                     )
-                    self.store.complete_admin_notification(target_key)
-                    logger.info(f"[{self.name}] notified admin group about {action} for {sender_username}")
+                    self.store.complete_admin_notification(target_key, action)
+                    logger.info(
+                        f"[{self.name}] delivered manager notification via "
+                        f"{channel} about {action} for {sender_username}"
+                    )
                 except Exception as e:
-                    self.store.fail_admin_notification(target_key, e)
+                    self.store.fail_admin_notification(target_key, action, e)
                     logger.error(
                         f"[{self.name}] failed to notify admin group about warm lead {sender_username}: {e}"
                     )
@@ -367,6 +504,7 @@ class AccountWorker:
         except Exception as e:
             logger.error(f"[{self.name}] private reply task failed for {sender_username}: {e}")
         finally:
-            current_task = asyncio.current_task()
-            if self.pending_reply_tasks.get(target_key) is current_task:
+            if lock_acquired:
+                reply_lock.release()
+            if task_state is not None and self.pending_reply_tasks.get(target_key) is task_state:
                 self.pending_reply_tasks.pop(target_key, None)

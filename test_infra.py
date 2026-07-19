@@ -7,6 +7,12 @@ import unittest
 from unittest import mock
 
 
+class FakeFloodWaitError(Exception):
+    def __init__(self, seconds=1):
+        super().__init__(f"wait {seconds}")
+        self.seconds = seconds
+
+
 if "requests" not in sys.modules:
     sys.modules["requests"] = types.ModuleType("requests")
 
@@ -24,13 +30,14 @@ if "telethon" not in sys.modules:
     telethon = types.ModuleType("telethon")
     telethon.TelegramClient = object
     telethon.events = types.SimpleNamespace()
-    telethon.errors = types.SimpleNamespace(FloodWaitError=Exception)
+    telethon.errors = types.SimpleNamespace(FloodWaitError=FakeFloodWaitError)
     sys.modules["telethon"] = telethon
 
 if "telethon.sessions" not in sys.modules:
     sys.modules["telethon.sessions"] = types.SimpleNamespace(StringSession=object)
 
 from hermes import config
+from hermes.app import recover_orphaned_notifications
 from hermes.dashboard import Handler, qr_svg
 from hermes.dispatcher import Dispatcher
 from hermes.llm import LLMRouter, LLMUnavailable
@@ -302,6 +309,15 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         claimed = store.claim_next_pending("main", max_attempts=3)
         self.assertEqual(claimed["lead_key"], "lead_user")
 
+    def test_find_lead_is_case_insensitive(self):
+        store = self.make_store()
+        store.add_contacted("JohnDoe", "main", "sent")
+
+        self.assertEqual(
+            store.find_lead("JOHNDOE", None)["lead_key"],
+            "johndoe",
+        )
+
     def test_enqueue_skips_already_contacted(self):
         store = self.make_store()
         store.add_contacted("user1", "main", "sent")
@@ -387,21 +403,286 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         store = self.make_store()
         store.add_contacted("warm_lead", "main", "notification_pending")
         store.enqueue_admin_notification(
-            "warm_lead", "main", "MaksIgitov", "manager message", "warm_notified"
+            "warm_lead",
+            "main",
+            "MaksIgitov",
+            "handoff_to_manager",
+            "manager message",
+            "warm_notified",
         )
 
         pending = store.pending_admin_notifications()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["recipient"], "MaksIgitov")
+        self.assertEqual(pending[0]["action"], "handoff_to_manager")
         self.assertEqual(pending[0]["message"], "manager message")
 
-        store.fail_admin_notification("warm_lead", "temporary failure")
+        store.fail_admin_notification(
+            "warm_lead",
+            "handoff_to_manager",
+            "temporary failure",
+        )
         self.assertEqual(store.pending_admin_notifications()[0]["attempts"], 1)
-        self.assertTrue(store.complete_admin_notification("warm_lead"))
+        self.assertTrue(
+            store.complete_admin_notification(
+                "warm_lead",
+                "handoff_to_manager",
+            )
+        )
         self.assertEqual(store.pending_admin_notifications(), [])
         lead = store.get_lead("warm_lead")
         self.assertEqual(lead["status"], "warm_notified")
         self.assertIsNotNone(lead["manager_notified_at"])
+        self.assertEqual(lead["last_notified_action"], "handoff_to_manager")
+
+    def test_handoff_decision_and_outbox_intent_are_atomic(self):
+        store = self.make_store()
+        store.add_contacted("lead", "main", "sent")
+        decision = {
+            "stage": "ready_to_test",
+            "action": "handoff_to_manager",
+            "status": "notification_pending",
+        }
+
+        already_notified = store.apply_decision_and_enqueue_notification(
+            "lead",
+            decision,
+            "main",
+            "MaksIgitov",
+            "warm message",
+            "warm_notified",
+        )
+
+        self.assertFalse(already_notified)
+        lead = store.get_lead("lead")
+        self.assertEqual(lead["status"], "notification_pending")
+        self.assertEqual(lead["last_action"], "handoff_to_manager")
+        pending = store.pending_admin_notifications()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["action"], "handoff_to_manager")
+
+    def test_orphaned_pending_handoff_is_recovered_on_startup(self):
+        store = self.make_store()
+        store.add_contacted("lead", "main", "notification_pending")
+        store.record_message("lead", "main", "in", "Да, давайте")
+        account = config.AccountConfig(
+            name="main",
+            api_id=1,
+            api_hash="hash",
+            session="session",
+            manager_username="MaksIgitov",
+        )
+
+        self.assertEqual(
+            recover_orphaned_notifications(
+                store,
+                [account],
+                "fallback_manager",
+            ),
+            1,
+        )
+        pending = store.pending_admin_notifications()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["recipient"], "MaksIgitov")
+        self.assertIn("Да, давайте", pending[0]["message"])
+        self.assertEqual(
+            recover_orphaned_notifications(
+                store,
+                [account],
+                "fallback_manager",
+            ),
+            0,
+        )
+
+    def test_manual_review_notification_does_not_suppress_handoff(self):
+        store = self.make_store()
+        store.add_contacted("lead", "main", "sent")
+        manual = {"action": "manual_review", "status": "manual_review"}
+        handoff = {"action": "handoff_to_manager", "status": "notification_pending"}
+
+        self.assertFalse(store.apply_decision("lead", manual, replied=False))
+        store.enqueue_admin_notification(
+            "lead",
+            "main",
+            "MaksIgitov",
+            "manual_review",
+            "manual message",
+            "manual_review",
+        )
+        store.complete_admin_notification("lead", "manual_review")
+
+        self.assertTrue(store.apply_decision("lead", manual, replied=False))
+        self.assertFalse(store.apply_decision("lead", handoff, replied=True))
+
+    def test_outbox_claim_prevents_concurrent_duplicate_delivery(self):
+        store = self.make_store()
+        store.add_contacted("lead", "main", "notification_pending")
+        store.enqueue_admin_notification(
+            "lead",
+            "main",
+            "MaksIgitov",
+            "handoff_to_manager",
+            "warm message",
+            "warm_notified",
+        )
+
+        self.assertTrue(
+            store.claim_admin_notification("lead", "handoff_to_manager")
+        )
+        self.assertFalse(
+            store.claim_admin_notification("lead", "handoff_to_manager")
+        )
+        self.assertEqual(store.claim_pending_admin_notifications(), [])
+
+        store.fail_admin_notification(
+            "lead",
+            "handoff_to_manager",
+            "temporary",
+        )
+        pending = store.pending_admin_notifications()[0]
+        self.assertGreater(pending["next_attempt_at"], pending["updated_at"])
+        self.assertFalse(
+            store.claim_admin_notification("lead", "handoff_to_manager")
+        )
+
+    def test_failed_notifications_do_not_starve_new_handoffs(self):
+        store = self.make_store()
+        for index in range(25):
+            lead_key = f"lead_{index:02d}"
+            store.add_contacted(lead_key, "main", "notification_pending")
+            store.enqueue_admin_notification(
+                lead_key,
+                "main",
+                "MaksIgitov",
+                "handoff_to_manager",
+                f"message {index}",
+                "warm_notified",
+            )
+            if index < 20:
+                store.fail_admin_notification(
+                    lead_key,
+                    "handoff_to_manager",
+                    "poison",
+                )
+
+        claimed = store.claim_pending_admin_notifications(limit=20)
+
+        self.assertEqual(
+            {item["lead_key"] for item in claimed},
+            {f"lead_{index:02d}" for index in range(20, 25)},
+        )
+
+    def test_manual_and_handoff_outbox_entries_can_coexist(self):
+        store = self.make_store()
+        store.add_contacted("lead", "main", "manual_review")
+        for action, message, status in (
+            ("manual_review", "manual message", "manual_review"),
+            ("handoff_to_manager", "warm message", "warm_notified"),
+        ):
+            store.enqueue_admin_notification(
+                "lead",
+                "main",
+                "MaksIgitov",
+                action,
+                message,
+                status,
+            )
+
+        self.assertEqual(
+            {item["action"] for item in store.pending_admin_notifications()},
+            {"manual_review", "handoff_to_manager"},
+        )
+        store.complete_admin_notification("lead", "handoff_to_manager")
+        store.complete_admin_notification("lead", "manual_review")
+        lead = store.get_lead("lead")
+        self.assertEqual(lead["status"], "warm_notified")
+        self.assertEqual(lead["last_notified_action"], "handoff_to_manager")
+
+    def test_old_single_key_outbox_schema_is_migrated(self):
+        import sqlite3
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        connection = sqlite3.connect(tmp.name)
+        connection.execute(
+            """CREATE TABLE admin_notifications (
+                   lead_key TEXT PRIMARY KEY,
+                   account TEXT,
+                   recipient TEXT,
+                   message TEXT NOT NULL,
+                   target_status TEXT NOT NULL,
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   last_error TEXT,
+                   created_at REAL NOT NULL,
+                   updated_at REAL NOT NULL
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO admin_notifications
+                   (lead_key, account, recipient, message, target_status,
+                    created_at, updated_at)
+               VALUES ('lead', 'main', 'MaksIgitov', 'warm message',
+                       'warm_notified', 1, 1)"""
+        )
+        connection.commit()
+        connection.close()
+
+        store = Store(tmp.name)
+        self.addCleanup(
+            lambda: (
+                store.close(),
+                os.path.exists(tmp.name) and os.unlink(tmp.name),
+            )
+        )
+
+        pending = store.pending_admin_notifications()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["action"], "handoff_to_manager")
+        self.assertIn("claimed_at", pending[0])
+
+    def test_old_manual_review_state_is_reopened_and_backfilled(self):
+        import sqlite3
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        connection = sqlite3.connect(tmp.name)
+        connection.execute(
+            """CREATE TABLE leads (
+                   lead_key TEXT PRIMARY KEY,
+                   peer_id INTEGER,
+                   account TEXT,
+                   status TEXT NOT NULL,
+                   date TEXT,
+                   timestamp REAL,
+                   reply_count INTEGER NOT NULL DEFAULT 0,
+                   last_reply_date TEXT,
+                   last_stage TEXT,
+                   last_action TEXT,
+                   manager_notified_at REAL,
+                   stop_reason TEXT
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO leads
+                   (lead_key, account, status, reply_count, last_action,
+                    manager_notified_at)
+               VALUES ('lead', 'main', 'manual_review', 999,
+                       'manual_review', 1)"""
+        )
+        connection.commit()
+        connection.close()
+
+        store = Store(tmp.name)
+        self.addCleanup(
+            lambda: (
+                store.close(),
+                os.path.exists(tmp.name) and os.unlink(tmp.name),
+            )
+        )
+
+        lead = store.get_lead("lead")
+        self.assertEqual(lead["reply_count"], 0)
+        self.assertEqual(lead["last_notified_action"], "manual_review")
 
     def test_legacy_json_migration(self):
         import json
@@ -524,6 +805,37 @@ class AdminNotifierTests(unittest.TestCase):
 
         self.assertEqual(channel, "mtproto:@andrew_pontific")
         self.assertEqual(client.sent, [("@andrew_pontific", "warm lead")])
+
+    def test_transient_bot_api_failure_does_not_disable_route(self):
+        client = _NotifierClient(True)
+        notifier = AdminNotifier(
+            "token",
+            "-100123",
+            client_provider=lambda: [client],
+        )
+        notifier._send_via_bot_api = mock.Mock(
+            side_effect=RuntimeError("connection timeout")
+        )
+
+        channel = asyncio.run(notifier.notify("warm lead"))
+
+        self.assertEqual(channel, "mtproto")
+        self.assertFalse(notifier.bot_api_failed)
+
+    def test_permanent_bot_api_failure_disables_route(self):
+        client = _NotifierClient(True)
+        notifier = AdminNotifier(
+            "token",
+            "-100123",
+            client_provider=lambda: [client],
+        )
+        notifier._send_via_bot_api = mock.Mock(
+            side_effect=RuntimeError("Bad Request: chat not found")
+        )
+
+        asyncio.run(notifier.notify("warm lead"))
+
+        self.assertTrue(notifier.bot_api_failed)
 
 
 class AccountWorkerQueueTests(TempStoreMixin, unittest.TestCase):

@@ -6,6 +6,12 @@ import types
 import unittest
 
 
+class FakeFloodWaitError(Exception):
+    def __init__(self, seconds=1):
+        super().__init__(f"wait {seconds}")
+        self.seconds = seconds
+
+
 if "requests" not in sys.modules:
     sys.modules["requests"] = types.ModuleType("requests")
 
@@ -23,7 +29,7 @@ if "telethon" not in sys.modules:
     telethon = types.ModuleType("telethon")
     telethon.TelegramClient = object
     telethon.events = types.SimpleNamespace()
-    telethon.errors = types.SimpleNamespace(FloodWaitError=Exception)
+    telethon.errors = types.SimpleNamespace(FloodWaitError=FakeFloodWaitError)
     sys.modules["telethon"] = telethon
 
 if "telethon.sessions" not in sys.modules:
@@ -34,7 +40,7 @@ from hermes import worker as worker_module
 from hermes.config import AccountConfig, Settings
 from hermes.sales import SalesBrain
 from hermes.store import Store
-from hermes.worker import AccountWorker
+from hermes.worker import AccountWorker, PitchRetryable
 
 
 def make_settings(**overrides):
@@ -52,6 +58,8 @@ def make_settings(**overrides):
         generic_limit_cooldown_seconds=18000,
         flood_wait_extra_seconds=300,
         incoming_reply_debounce_seconds=0,
+        reply_daily_cap=10,
+        notify_retry_interval_seconds=60,
         max_pitch_attempts=5,
         db_path=":memory:",
         legacy_json_path="",
@@ -59,6 +67,27 @@ def make_settings(**overrides):
     )
     values.update(overrides)
     return Settings(**values)
+
+
+def client_history(message):
+    return (
+        "Я (менеджер Пульсар): Добрый день\n\n"
+        f"Клиент (@lead123): {message}"
+    )
+
+
+class SequenceRouter:
+    def __init__(self, texts):
+        self.texts = iter(texts)
+        self.calls = 0
+
+    def chat(self, task, messages, **kwargs):
+        self.calls += 1
+        return types.SimpleNamespace(
+            text=next(self.texts),
+            provider="test",
+            model="classifier",
+        )
 
 
 class SalesFlowDecisionTests(unittest.TestCase):
@@ -150,6 +179,15 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertFalse(decision["notify_manager"])
         self.assertEqual(decision["reply_text"], "reply for needs_explanation")
 
+    def test_affirmative_price_statement_is_not_treated_as_question(self):
+        self.set_stage("ready_to_test")
+
+        decision = self.decide_for_message("Цена устраивает, давайте")
+
+        self.assertEqual(decision["stage"], "ready_to_test")
+        self.assertEqual(decision["action"], "handoff_to_manager")
+        self.assertTrue(decision["notify_manager"])
+
     def test_handoff_can_target_account_specific_manager(self):
         self.set_stage("ready_to_test")
         history = "Я (менеджер Пульсар): Добрый день\n\nКлиент (@lead123): готов тестировать"
@@ -238,6 +276,22 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertEqual(classification["stage"], "not_interested")
         self.assertEqual(classification["confidence"], 1.0)
 
+    def test_classifier_retries_unknown_result_once(self):
+        router = SequenceRouter(
+            [
+                "not json",
+                '{"stage":"primary_interest","reason":"ok","confidence":0.9}',
+            ]
+        )
+        brain = SalesBrain(router=router, settings=make_settings())
+
+        classification = brain.classify_conversation_stage(
+            client_history("расскажите подробнее")
+        )
+
+        self.assertEqual(classification["stage"], "primary_interest")
+        self.assertEqual(router.calls, 2)
+
     def test_fallback_followup_asks_only_about_search_format(self):
         reply = self.brain.fallback_reply_for_stage("primary_interest")
 
@@ -268,6 +322,35 @@ class ExtractionTests(unittest.TestCase):
     def test_extract_lead_context(self):
         text = "заголовок\n📄 Оригинал\n\nищу инструмент для лидов"
         self.assertEqual(sales.extract_lead_context(text), "ищу инструмент для лидов")
+
+
+class ExplicitNegativeGuardTests(unittest.TestCase):
+    def test_short_refusal_stops(self):
+        result = sales.stage_from_explicit_negative(client_history("стоп"))
+        self.assertEqual(result["stage"], "not_interested")
+
+    def test_negative_substring_inside_word_is_not_refusal(self):
+        self.assertIsNone(
+            sales.stage_from_explicit_negative(
+                client_history("Интересует постоплата")
+            )
+        )
+
+    def test_question_with_negative_phrase_is_not_refusal(self):
+        self.assertIsNone(
+            sales.stage_from_explicit_negative(
+                client_history("мне ничего не надо настраивать?")
+            )
+        )
+
+    def test_long_message_is_left_to_classifier(self):
+        message = (
+            "сейчас не актуально, но мы планируем расширять отдел продаж в "
+            "следующем квартале и хотим вернуться к вопросу позже"
+        )
+        self.assertIsNone(
+            sales.stage_from_explicit_negative(client_history(message))
+        )
 
 
 class FakeAction:
@@ -308,13 +391,49 @@ class FakeClient:
         self.sent_messages.append((chat_id, text))
 
 
+class FailingSendClient(FakeClient):
+    async def send_message(self, chat_id, text):
+        raise RuntimeError("network down")
+
+
+class BlockingSendClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.release_send = asyncio.Event()
+
+    async def send_message(self, chat_id, text):
+        self.send_started.set()
+        await self.release_send.wait()
+        await super().send_message(chat_id, text)
+
+
 class FakeNotifier:
     def __init__(self):
         self.notifications = []
+        self.error = None
 
     async def notify(self, message, fallback_username=None, preferred_client=None):
+        if self.error:
+            raise self.error
         self.notifications.append(message)
         return "fake"
+
+
+class BlockingNotifier(FakeNotifier):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def notify(self, message, fallback_username=None, preferred_client=None):
+        self.started.set()
+        await self.release.wait()
+        return await super().notify(
+            message,
+            fallback_username=fallback_username,
+            preferred_client=preferred_client,
+        )
 
 
 class FakeSender:
@@ -332,6 +451,32 @@ class FakeEvent:
 
     async def get_sender(self):
         return self._sender
+
+
+def worker_decision(action, reply_text="", status=None):
+    stages = {
+        "handoff_to_manager": "ready_to_test",
+        "manual_review": "unknown",
+        "send_reply": "primary_interest",
+        "silent_stop": "not_interested",
+    }
+    statuses = {
+        "handoff_to_manager": "warm_notified",
+        "manual_review": "manual_review",
+        "send_reply": "in_dialog",
+        "silent_stop": "stopped",
+    }
+    return {
+        "stage": stages[action],
+        "action": action,
+        "reply_text": reply_text,
+        "notify_manager": action in {"handoff_to_manager", "manual_review"},
+        "status": status or statuses[action],
+        "reason": "test reason",
+        "confidence": 0.98,
+        "requires_action": action in {"handoff_to_manager", "manual_review"},
+        "action_reason": "test reason",
+    }
 
 
 class ProcessPrivateReplySmokeTests(unittest.TestCase):
@@ -381,7 +526,7 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         self.assertEqual(lead["status"], "warm_notified")
         self.assertEqual(lead["last_stage"], "ready_to_test")
         self.assertEqual(lead["last_action"], "handoff_to_manager")
-        self.assertEqual(lead["reply_count"], 999)
+        self.assertEqual(lead["reply_count"], 0)
         self.assertTrue(lead["manager_notified_at"])
         self.assertEqual(len(self.notifier.notifications), 1)
         self.assertEqual(len(self.worker.client.sent_messages), 1)
@@ -391,6 +536,231 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         directions = [t["direction"] for t in transcript]
         self.assertIn("event", directions)
         self.assertIn("out", directions)
+
+    def test_manager_notified_when_handoff_reply_fails(self):
+        self.worker.client = FailingSendClient()
+
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        lead = self.store.get_lead("lead123")
+        self.assertEqual(lead["status"], "warm_notified")
+        self.assertEqual(len(self.notifier.notifications), 1)
+        self.assertIn("НЕ доставлен", self.notifier.notifications[0])
+        self.assertIn(self.brain.handoff_message(), self.notifier.notifications[0])
+
+    def test_handoff_intent_survives_worker_stop_during_client_send(self):
+        client = BlockingSendClient()
+        self.worker.client = client
+        event = FakeEvent(FakeSender(555, "lead123"))
+
+        async def run_case():
+            await self.worker._pm_handler(event)
+            task = self.worker.pending_reply_tasks["lead123"]["task"]
+            await client.send_started.wait()
+            self.assertEqual(
+                self.store.get_lead("lead123")["status"],
+                "notification_pending",
+            )
+            self.assertEqual(
+                self.store.pending_admin_notifications()[0]["action"],
+                "handoff_to_manager",
+            )
+            await self.worker.stop()
+            await asyncio.gather(
+                task,
+                return_exceptions=True,
+            )
+
+        asyncio.run(run_case())
+
+        self.assertEqual(
+            self.store.get_lead("lead123")["status"],
+            "notification_pending",
+        )
+        self.assertEqual(len(self.store.pending_admin_notifications()), 1)
+
+    def test_failed_notification_stays_pending_until_retry(self):
+        self.notifier.error = RuntimeError("notification network down")
+
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        self.assertEqual(
+            self.store.get_lead("lead123")["status"],
+            "notification_pending",
+        )
+        pending = self.store.pending_admin_notifications()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["action"], "handoff_to_manager")
+
+        self.notifier.error = None
+
+        async def retry():
+            item = self.store.pending_admin_notifications()[0]
+            await self.notifier.notify(item["message"])
+            self.store.complete_admin_notification(
+                item["lead_key"],
+                item["action"],
+            )
+
+        asyncio.run(retry())
+        self.assertEqual(
+            self.store.get_lead("lead123")["status"],
+            "warm_notified",
+        )
+        self.assertEqual(self.store.pending_admin_notifications(), [])
+
+    def test_reply_cap_does_not_block_handoff(self):
+        for _ in range(self.settings.reply_daily_cap + 5):
+            self.store.apply_decision(
+                "lead123",
+                {"action": "send_reply", "status": "in_dialog"},
+                replied=True,
+            )
+
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        self.assertEqual(
+            self.store.get_lead("lead123")["status"],
+            "warm_notified",
+        )
+        self.assertEqual(len(self.notifier.notifications), 1)
+
+    def test_reply_cap_still_blocks_ordinary_reply(self):
+        for _ in range(self.settings.reply_daily_cap):
+            self.store.apply_decision(
+                "lead123",
+                {"action": "send_reply", "status": "in_dialog"},
+                replied=True,
+            )
+        self.brain.generate_conversational_reply = (
+            lambda history, lead_key=None, manager_username=None: worker_decision(
+                "send_reply",
+                reply_text="ordinary reply",
+            )
+        )
+
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        self.assertEqual(self.worker.client.sent_messages, [])
+        self.assertEqual(self.notifier.notifications, [])
+
+    def test_manual_review_does_not_block_later_handoff(self):
+        self.brain.generate_conversational_reply = (
+            lambda history, lead_key=None, manager_username=None: worker_decision(
+                "manual_review"
+            )
+        )
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        self.assertEqual(
+            self.store.get_lead("lead123")["status"],
+            "manual_review",
+        )
+        self.assertEqual(len(self.notifier.notifications), 1)
+
+        self.brain.generate_conversational_reply = (
+            lambda history, lead_key=None, manager_username=None: worker_decision(
+                "handoff_to_manager",
+                reply_text=self.brain.handoff_message(),
+            )
+        )
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        lead = self.store.get_lead("lead123")
+        self.assertEqual(lead["status"], "warm_notified")
+        self.assertEqual(lead["last_notified_action"], "handoff_to_manager")
+        self.assertEqual(len(self.notifier.notifications), 2)
+
+    def test_new_message_does_not_cancel_handoff_in_progress(self):
+        blocking = BlockingNotifier()
+        self.worker.notifier = blocking
+        event = FakeEvent(FakeSender(555, "lead123"))
+
+        async def run_case():
+            await self.worker._pm_handler(event)
+            first_state = self.worker.pending_reply_tasks["lead123"]
+            await blocking.started.wait()
+            await self.worker._pm_handler(event)
+            second_state = self.worker.pending_reply_tasks["lead123"]
+            self.assertIsNot(first_state, second_state)
+            self.assertFalse(first_state["task"].cancelled())
+            blocking.release.set()
+            await asyncio.gather(
+                first_state["task"],
+                second_state["task"],
+            )
+
+        asyncio.run(run_case())
+
+        self.assertEqual(len(blocking.notifications), 1)
+        self.assertEqual(
+            self.store.get_lead("lead123")["status"],
+            "warm_notified",
+        )
+
+    def test_failed_cold_pitch_is_parked_and_reported(self):
+        self.brain.build_pitch_message = lambda target, context: "cold pitch"
+        self.worker.client = FailingSendClient()
+
+        result = asyncio.run(
+            self.worker.process_lead(
+                {"lead_key": "cold_lead", "context": "context"}
+            )
+        )
+
+        self.assertEqual(result, "failed")
+        self.assertEqual(
+            self.store.get_lead("cold_lead")["status"],
+            "manual_required",
+        )
+        self.assertEqual(len(self.notifier.notifications), 1)
+        self.assertIn("cold pitch", self.notifier.notifications[0])
+        self.assertEqual(self.store.pending_admin_notifications(), [])
+
+    def test_failed_cold_pitch_notification_stays_in_outbox(self):
+        self.brain.build_pitch_message = lambda target, context: "cold pitch"
+        self.worker.client = FailingSendClient()
+        self.notifier.error = RuntimeError("notification down")
+
+        asyncio.run(
+            self.worker.process_lead(
+                {"lead_key": "cold_lead", "context": "context"}
+            )
+        )
+
+        pending = self.store.pending_admin_notifications()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["action"], "manual_required")
+        self.assertEqual(pending[0]["attempts"], 1)
+
+    def test_cold_pitch_rechecks_daily_limit_after_delay(self):
+        self.brain.build_pitch_message = lambda target, context: "cold pitch"
+        self.worker.cfg.cold_dm_daily_limit = 1
+
+        with self.assertRaises(PitchRetryable):
+            asyncio.run(
+                self.worker.process_lead(
+                    {"lead_key": "cold_lead", "context": "context"}
+                )
+            )
+
+        self.assertIsNone(self.store.get_lead("cold_lead"))
+        self.assertEqual(self.worker.client.sent_messages, [])
 
     def test_pm_handler_ignores_lead_of_another_account(self):
         self.store.add_contacted("other_lead", "second", "sent")
@@ -408,9 +778,9 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
 
         async def run_case():
             await self.worker._pm_handler(FakeEvent(FakeSender(777, "legacy_lead")))
-            task = self.worker.pending_reply_tasks.get("legacy_lead")
-            self.assertIsNotNone(task)
-            await task
+            state = self.worker.pending_reply_tasks.get("legacy_lead")
+            self.assertIsNotNone(state)
+            await state["task"]
 
         asyncio.run(run_case())
         lead = self.store.get_lead("legacy_lead")
