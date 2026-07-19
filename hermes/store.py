@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS account_control (
     enabled INTEGER NOT NULL DEFAULT 1,
     daily_limit INTEGER
 );
+CREATE TABLE IF NOT EXISTS admin_notifications (
+    lead_key TEXT PRIMARY KEY,
+    account TEXT,
+    recipient TEXT,
+    message TEXT NOT NULL,
+    target_status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -286,6 +297,68 @@ class Store:
                 (time.time(), status, lead_key),
             )
             self._conn.commit()
+
+    # --- durable admin notification outbox ------------------------------
+
+    def enqueue_admin_notification(
+        self, lead_key, account, recipient, message, target_status
+    ):
+        lead_key = _lead_key(lead_key)
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO admin_notifications
+                       (lead_key, account, recipient, message, target_status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(lead_key) DO UPDATE SET
+                       account=excluded.account,
+                       recipient=excluded.recipient,
+                       message=excluded.message,
+                       target_status=excluded.target_status,
+                       updated_at=excluded.updated_at""",
+                (lead_key, account, recipient, message, target_status, now, now),
+            )
+            self._conn.commit()
+
+    def pending_admin_notifications(self, limit=20):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM admin_notifications ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def fail_admin_notification(self, lead_key, error):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE admin_notifications
+                   SET attempts=attempts+1, last_error=?, updated_at=?
+                   WHERE lead_key=?""",
+                (str(error)[:500], time.time(), lead_key),
+            )
+            self._conn.commit()
+
+    def complete_admin_notification(self, lead_key):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT target_status FROM admin_notifications WHERE lead_key=?",
+                (lead_key,),
+            ).fetchone()
+            if row is None:
+                return False
+            now = time.time()
+            self._conn.execute(
+                "UPDATE leads SET manager_notified_at=?, status=? WHERE lead_key=?",
+                (now, row["target_status"], lead_key),
+            )
+            self._conn.execute(
+                "DELETE FROM admin_notifications WHERE lead_key=?",
+                (lead_key,),
+            )
+            self._conn.commit()
+            return True
 
     def sent_today(self, account):
         placeholders = ",".join("?" for _ in COUNTED_DAILY_STATUSES_EXCLUDED)

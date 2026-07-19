@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 SUPERVISOR_BACKOFF_START = 15
 SUPERVISOR_BACKOFF_MAX = 600
+NOTIFICATION_RETRY_SECONDS = 60
 
 
 async def supervise_worker(worker, notifier):
@@ -53,6 +54,40 @@ async def supervise_worker(worker, notifier):
         backoff = min(backoff * 2, SUPERVISOR_BACKOFF_MAX)
 
 
+async def retry_admin_notifications(store, notifier, workers):
+    """Deliver durable outbox entries until an admin channel confirms success."""
+    while True:
+        for item in store.pending_admin_notifications():
+            try:
+                preferred_client = next(
+                    (
+                        worker.client
+                        for worker in workers
+                        if worker.name == item["account"] and worker.is_connected()
+                    ),
+                    None,
+                )
+                channel = await notifier.notify(
+                    item["message"],
+                    fallback_username=item.get("recipient"),
+                    preferred_client=preferred_client,
+                )
+                store.complete_admin_notification(item["lead_key"])
+                logger.info(
+                    f"[{item['account'] or '-'}] delivered pending admin notification "
+                    f"for {item['lead_key']} via {channel}"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                store.fail_admin_notification(item["lead_key"], e)
+                logger.error(
+                    f"[{item['account'] or '-'}] pending admin notification failed "
+                    f"for {item['lead_key']}: {e}"
+                )
+        await asyncio.sleep(NOTIFICATION_RETRY_SECONDS)
+
+
 async def main():
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -87,9 +122,7 @@ async def main():
         settings.bot_token,
         settings.bot_chat_id,
         settings.proxy_url,
-        client_provider=lambda: next(
-            (w.client for w in workers if w.is_connected()), None
-        ),
+        client_provider=lambda: [w.client for w in workers if w.is_connected()],
     )
 
     dispatcher = Dispatcher(store, workers, settings, notifier=notifier)
@@ -112,6 +145,12 @@ async def main():
 
     tasks = [asyncio.create_task(supervise_worker(w, notifier), name=f"worker:{w.name}") for w in workers]
     tasks.append(asyncio.create_task(dispatcher.run(), name="dispatcher"))
+    tasks.append(
+        asyncio.create_task(
+            retry_admin_notifications(store, notifier, workers),
+            name="admin-notification-retry",
+        )
+    )
 
     try:
         await asyncio.gather(*tasks)

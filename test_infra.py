@@ -34,6 +34,7 @@ from hermes import config
 from hermes.dashboard import Handler, qr_svg
 from hermes.dispatcher import Dispatcher
 from hermes.llm import LLMRouter, LLMUnavailable
+from hermes.notify import AdminNotifier
 from hermes.store import Store
 from hermes.worker import AccountWorker
 from test_sales_flow import make_settings
@@ -382,6 +383,26 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         self.assertEqual(snapshot["warm"], 1)
         self.assertEqual(snapshot["accounts"][0]["enabled"], 0)
 
+    def test_admin_notification_outbox_completes_status_atomically(self):
+        store = self.make_store()
+        store.add_contacted("warm_lead", "main", "notification_pending")
+        store.enqueue_admin_notification(
+            "warm_lead", "main", "MaksIgitov", "manager message", "warm_notified"
+        )
+
+        pending = store.pending_admin_notifications()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["recipient"], "MaksIgitov")
+        self.assertEqual(pending[0]["message"], "manager message")
+
+        store.fail_admin_notification("warm_lead", "temporary failure")
+        self.assertEqual(store.pending_admin_notifications()[0]["attempts"], 1)
+        self.assertTrue(store.complete_admin_notification("warm_lead"))
+        self.assertEqual(store.pending_admin_notifications(), [])
+        lead = store.get_lead("warm_lead")
+        self.assertEqual(lead["status"], "warm_notified")
+        self.assertIsNotNone(lead["manager_notified_at"])
+
     def test_legacy_json_migration(self):
         import json
 
@@ -444,6 +465,65 @@ class _FakeClient:
 class _FakeNotifier:
     async def notify(self, message):
         pass
+
+
+class _NotifierClient:
+    def __init__(self, works):
+        self.works = works
+        self.sent = []
+
+    async def get_entity(self, chat_id):
+        if not self.works:
+            raise ValueError("unknown peer")
+        return f"entity:{chat_id}"
+
+    async def iter_dialogs(self):
+        if False:
+            yield None
+
+    async def send_message(self, entity, message):
+        self.sent.append((entity, message))
+
+
+class AdminNotifierTests(unittest.TestCase):
+    def test_mtproto_tries_every_connected_account(self):
+        first = _NotifierClient(False)
+        second = _NotifierClient(True)
+        notifier = AdminNotifier(
+            "",
+            "-100123",
+            client_provider=lambda: [first, second],
+        )
+
+        channel = asyncio.run(notifier.notify("warm lead"))
+
+        self.assertEqual(channel, "mtproto")
+        self.assertEqual(second.sent, [("entity:-100123", "warm lead")])
+
+    def test_notify_raises_when_all_channels_fail(self):
+        notifier = AdminNotifier(
+            "",
+            "-100123",
+            client_provider=lambda: [_NotifierClient(False)],
+        )
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(notifier.notify("warm lead"))
+
+    def test_direct_manager_is_last_resort(self):
+        client = _NotifierClient(False)
+        notifier = AdminNotifier(
+            "",
+            "-100123",
+            client_provider=lambda: [client],
+        )
+
+        channel = asyncio.run(
+            notifier.notify("warm lead", fallback_username="andrew_pontific")
+        )
+
+        self.assertEqual(channel, "mtproto:@andrew_pontific")
+        self.assertEqual(client.sent, [("@andrew_pontific", "warm lead")])
 
 
 class AccountWorkerQueueTests(TempStoreMixin, unittest.TestCase):

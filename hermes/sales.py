@@ -35,7 +35,7 @@ SEND_REPLY_STAGES = {
     "qualification_needed",
     "objection_without_commitment",
 }
-TERMINAL_STATUSES = {"warm_notified", "stopped", "manual_review"}
+TERMINAL_STATUSES = {"notification_pending", "warm_notified", "stopped", "manual_review"}
 LOW_CONFIDENCE_THRESHOLD = 0.55
 
 EXPLICIT_NEGATIVE_RE = re.compile(

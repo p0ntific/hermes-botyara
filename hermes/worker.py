@@ -322,21 +322,43 @@ class AccountWorker:
             else:
                 logger.info(f"[{self.name}] AI action for {sender_username} has no client reply: {action}")
 
+            stored_decision = ai_response
+            if should_notify_manager:
+                stored_decision = dict(ai_response)
+                stored_decision["status"] = "notification_pending"
             already_notified = self.store.apply_decision(
-                target_key, ai_response, replied=bool(reply_text.strip())
+                target_key, stored_decision, replied=bool(reply_text.strip())
             )
 
             if should_notify_manager and not already_notified:
                 try:
                     warm_history = await self.get_history_text(chat_id, sender_username, limit=30)
                     notification_history = warm_history or notification_history
-                    manager_msg = sales.manager_notification_text(
-                        sender_username, ai_response, notification_history, account=self.name
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.name}] failed to refresh notification history for "
+                        f"{sender_username}: {e}"
                     )
-                    await self.notifier.notify(manager_msg)
-                    self.store.mark_manager_notified(target_key, status)
+                manager_msg = sales.manager_notification_text(
+                    sender_username, ai_response, notification_history, account=self.name
+                )
+                self.store.enqueue_admin_notification(
+                    target_key,
+                    self.name,
+                    self.cfg.manager_username,
+                    manager_msg,
+                    status or "manual_review",
+                )
+                try:
+                    await self.notifier.notify(
+                        manager_msg,
+                        fallback_username=self.cfg.manager_username,
+                        preferred_client=self.client,
+                    )
+                    self.store.complete_admin_notification(target_key)
                     logger.info(f"[{self.name}] notified admin group about {action} for {sender_username}")
                 except Exception as e:
+                    self.store.fail_admin_notification(target_key, e)
                     logger.error(
                         f"[{self.name}] failed to notify admin group about warm lead {sender_username}: {e}"
                     )

@@ -312,8 +312,9 @@ class FakeNotifier:
     def __init__(self):
         self.notifications = []
 
-    async def notify(self, message):
+    async def notify(self, message, fallback_username=None, preferred_client=None):
         self.notifications.append(message)
+        return "fake"
 
 
 class FakeSender:

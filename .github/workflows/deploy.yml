@@ -152,6 +152,7 @@ jobs:
             fi
             if has_env_value API_ID_ACC14 && has_env_value API_HASH_ACC14 && has_env_value SESSION_ACC14; then
               append_account acc14 API_ID_ACC14 API_HASH_ACC14 SESSION_ACC14 MaksIgitov 3
+              printf '%s\n' '    enabled: false' >> accounts.yaml
             fi
 
             if [ "$(grep -c 'name:' accounts.yaml)" -eq 0 ]; then
