@@ -1,0 +1,19 @@
+# Telegram-аккаунты бота. Скопируйте в accounts.yaml и заполните.
+# Добавление аккаунта = добавление блока сюда + рестарт. Значения вида ${VAR}
+# подставляются из окружения (.env), чтобы секреты не жили в этом файле.
+accounts:
+  - name: main
+    api_id: ${API_ID}
+    api_hash: ${API_HASH}
+    session: ${SESSION}
+    # proxy: socks5h://127.0.0.1:9051   # опционально, свой прокси на аккаунт
+    # manager_username: andrew_pontific  # кого упоминать при handoff с этого аккаунта
+    # cold_dm_daily_limit: 5            # опционально, лимит холодных DM в день
+    # enabled: false                    # временно выключить аккаунт
+
+  # - name: second
+  #   api_id: ${API_ID_SECOND}
+  #   api_hash: ${API_HASH_SECOND}
+  #   session: ${SESSION_SECOND}
+  #   proxy: socks5h://127.0.0.1:9052
+  #   manager_username: MaksIgitov

@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes dashboard
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m hermes.dashboard
+Restart=always
+RestartSec=5
+WorkingDirectory=%h/.hermes
+Environment="PYTHONUNBUFFERED=1"
+Environment="DASHBOARD_BOOTSTRAP_IPS=93.158.188.81,93.158.188.99,199.21.98.167,127.0.0.1"
+Environment="DASHBOARD_PORT=8080"
+
+[Install]
+WantedBy=default.target

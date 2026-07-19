@@ -3,3 +3,5 @@ openai
 requests
 python-dotenv
 PySocks
+PyYAML
+qrcode
