@@ -499,12 +499,12 @@ def manager_notification_text(
     else:
         account_label = account or ""
     account_line = (
-        f"Аккаунт, который общался: {account_label}\n"
+        f"Telegram-профиль отправителя: {account_label}\n"
         if account_label
         else ""
     )
     manager_line = (
-        f"Передать менеджеру: @{manager_username.lstrip('@')}\n"
+        f"Ответственный менеджер: @{manager_username.lstrip('@')}\n"
         if manager_username
         else ""
     )
@@ -512,8 +512,8 @@ def manager_notification_text(
     note_block = f"{delivery_note}\n\n" if delivery_note else ""
     return (
         f"{title} @{sender_username}\n\n"
-        f"{account_line}"
         f"{manager_line}"
+        f"{account_line}"
         f"Stage: {decision.get('stage', 'unknown')}\n"
         f"Action: {action}\n"
         f"Confidence: {confidence:.2f}\n"

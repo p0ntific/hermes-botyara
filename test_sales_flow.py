@@ -539,12 +539,16 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         self.assertEqual(len(self.notifier.notifications), 1)
         self.assertEqual(len(self.worker.client.sent_messages), 1)
         self.assertIn(
-            "Аккаунт, который общался: Иван Петров (@sender_login)",
+            "Telegram-профиль отправителя: Иван Петров (@sender_login)",
             self.notifier.notifications[0],
         )
         self.assertIn(
-            "Передать менеджеру: @MaksIgitov",
+            "Ответственный менеджер: @MaksIgitov",
             self.notifier.notifications[0],
+        )
+        self.assertLess(
+            self.notifier.notifications[0].index("Ответственный менеджер:"),
+            self.notifier.notifications[0].index("Telegram-профиль отправителя:"),
         )
 
         transcript = self.store.get_transcript("lead123")
@@ -562,11 +566,11 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
 
         notification = self.notifier.notifications[0]
         self.assertIn(
-            "Аккаунт, который общался: Иван Петров",
+            "Telegram-профиль отправителя: Иван Петров",
             notification,
         )
         self.assertNotIn(
-            "Аккаунт, который общался: main",
+            "Telegram-профиль отправителя: main",
             notification,
         )
 
