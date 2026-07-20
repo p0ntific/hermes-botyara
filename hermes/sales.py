@@ -488,7 +488,12 @@ def manager_notification_text(
     last_message = get_last_client_message(history_text) or "<не удалось выделить последнюю реплику>"
     confidence = clamp_confidence(decision.get("confidence"))
     if account_username:
-        account_label = f"@{account_username.lstrip('@')}"
+        username_label = f"@{account_username.lstrip('@')}"
+        account_label = (
+            f"{account_display_name} ({username_label})"
+            if account_display_name
+            else username_label
+        )
     elif account_display_name:
         account_label = account_display_name
     else:

@@ -513,6 +513,7 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         self.worker = AccountWorker(cfg, self.settings, self.store, self.brain, self.notifier)
         self.worker.client = FakeClient()
         self.worker.telegram_username = "sender_login"
+        self.worker.telegram_display_name = "Иван Петров"
         self.worker.healthy = True
 
     def tearDown(self):
@@ -538,7 +539,7 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         self.assertEqual(len(self.notifier.notifications), 1)
         self.assertEqual(len(self.worker.client.sent_messages), 1)
         self.assertIn(
-            "Аккаунт, который общался: @sender_login",
+            "Аккаунт, который общался: Иван Петров (@sender_login)",
             self.notifier.notifications[0],
         )
         self.assertIn(
