@@ -503,9 +503,16 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         }
 
         self.notifier = FakeNotifier()
-        cfg = AccountConfig(name="main", api_id=1, api_hash="x", session="s")
+        cfg = AccountConfig(
+            name="main",
+            api_id=1,
+            api_hash="x",
+            session="s",
+            manager_username="MaksIgitov",
+        )
         self.worker = AccountWorker(cfg, self.settings, self.store, self.brain, self.notifier)
         self.worker.client = FakeClient()
+        self.worker.telegram_username = "sender_login"
         self.worker.healthy = True
 
     def tearDown(self):
@@ -530,7 +537,14 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         self.assertTrue(lead["manager_notified_at"])
         self.assertEqual(len(self.notifier.notifications), 1)
         self.assertEqual(len(self.worker.client.sent_messages), 1)
-        self.assertIn("Аккаунт: main", self.notifier.notifications[0])
+        self.assertIn(
+            "Аккаунт, который общался: @sender_login (main)",
+            self.notifier.notifications[0],
+        )
+        self.assertIn(
+            "Передать менеджеру: @MaksIgitov",
+            self.notifier.notifications[0],
+        )
 
         transcript = self.store.get_transcript("lead123")
         directions = [t["direction"] for t in transcript]

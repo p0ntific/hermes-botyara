@@ -43,6 +43,7 @@ class AccountWorker:
 
         self.client = None
         self.healthy = False
+        self.telegram_username = None
         self.pitch_lock = asyncio.Lock()
         self.pending_reply_tasks = {}
         self.reply_tasks = set()
@@ -65,9 +66,23 @@ class AccountWorker:
         self.client = self.build_client()
         self._register_handlers()
         await self.client.start()
+        try:
+            me = await self.client.get_me()
+            self.telegram_username = getattr(me, "username", None)
+        except Exception as e:
+            logger.warning(
+                f"[{self.name}] could not resolve account username: {e}"
+            )
         self.healthy = True
         self.store.set_account_health(self.name, True)
-        logger.info(f"[{self.name}] account connected, listening")
+        identity = (
+            f"@{self.telegram_username}"
+            if self.telegram_username
+            else "username unavailable"
+        )
+        logger.info(
+            f"[{self.name}] account connected, listening as {identity}"
+        )
         try:
             await self.client.run_until_disconnected()
         finally:
@@ -398,6 +413,8 @@ class AccountWorker:
                     ai_response,
                     notification_history,
                     account=self.name,
+                    account_username=self.telegram_username,
+                    manager_username=self.cfg.manager_username,
                 )
                 already_notified = (
                     self.store.apply_decision_and_enqueue_notification(
@@ -474,6 +491,8 @@ class AccountWorker:
                     ai_response,
                     notification_history,
                     account=self.name,
+                    account_username=self.telegram_username,
+                    manager_username=self.cfg.manager_username,
                     delivery_note=delivery_note,
                 )
                 self.store.update_admin_notification_message(

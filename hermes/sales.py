@@ -478,18 +478,36 @@ def manager_notification_text(
     decision,
     history_text,
     account=None,
+    account_username=None,
+    manager_username=None,
     delivery_note="",
 ):
     action = decision.get("action", "manual_review")
     title = "🔥 ТЕПЛЫЙ ЛИД" if action == "handoff_to_manager" else "⚠️ РУЧНАЯ ПРОВЕРКА"
     last_message = get_last_client_message(history_text) or "<не удалось выделить последнюю реплику>"
     confidence = clamp_confidence(decision.get("confidence"))
-    account_line = f"Аккаунт: {account}\n" if account else ""
+    if account_username:
+        account_label = f"@{account_username.lstrip('@')}"
+        if account:
+            account_label += f" ({account})"
+    else:
+        account_label = account or ""
+    account_line = (
+        f"Аккаунт, который общался: {account_label}\n"
+        if account_label
+        else ""
+    )
+    manager_line = (
+        f"Передать менеджеру: @{manager_username.lstrip('@')}\n"
+        if manager_username
+        else ""
+    )
     model_line = f"Модель: {decision['model']}\n" if decision.get("model") else ""
     note_block = f"{delivery_note}\n\n" if delivery_note else ""
     return (
         f"{title} @{sender_username}\n\n"
         f"{account_line}"
+        f"{manager_line}"
         f"Stage: {decision.get('stage', 'unknown')}\n"
         f"Action: {action}\n"
         f"Confidence: {confidence:.2f}\n"
