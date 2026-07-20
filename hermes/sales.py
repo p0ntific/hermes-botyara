@@ -487,8 +487,9 @@ def manager_notification_text(
     title = "🔥 ТЕПЛЫЙ ЛИД" if action == "handoff_to_manager" else "⚠️ РУЧНАЯ ПРОВЕРКА"
     last_message = get_last_client_message(history_text) or "<не удалось выделить последнюю реплику>"
     confidence = clamp_confidence(decision.get("confidence"))
-    if account_username:
-        username_label = f"@{account_username.lstrip('@')}"
+    mapped_username = account_username or manager_username
+    if mapped_username:
+        username_label = f"@{mapped_username.lstrip('@')}"
         account_label = (
             f"{account_display_name} ({username_label})"
             if account_display_name

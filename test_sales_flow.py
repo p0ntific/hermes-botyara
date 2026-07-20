@@ -566,7 +566,7 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
 
         notification = self.notifier.notifications[0]
         self.assertIn(
-            "Telegram-профиль отправителя: Иван Петров",
+            "Telegram-профиль отправителя: Иван Петров (@MaksIgitov)",
             notification,
         )
         self.assertNotIn(
