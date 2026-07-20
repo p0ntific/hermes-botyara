@@ -44,6 +44,7 @@ class AccountWorker:
         self.client = None
         self.healthy = False
         self.telegram_username = None
+        self.telegram_display_name = None
         self.pitch_lock = asyncio.Lock()
         self.pending_reply_tasks = {}
         self.reply_tasks = set()
@@ -69,6 +70,14 @@ class AccountWorker:
         try:
             me = await self.client.get_me()
             self.telegram_username = getattr(me, "username", None)
+            self.telegram_display_name = " ".join(
+                part
+                for part in (
+                    getattr(me, "first_name", None),
+                    getattr(me, "last_name", None),
+                )
+                if part
+            ) or None
         except Exception as e:
             logger.warning(
                 f"[{self.name}] could not resolve account username: {e}"
@@ -78,7 +87,7 @@ class AccountWorker:
         identity = (
             f"@{self.telegram_username}"
             if self.telegram_username
-            else "username unavailable"
+            else self.telegram_display_name or "identity unavailable"
         )
         logger.info(
             f"[{self.name}] account connected, listening as {identity}"
@@ -414,6 +423,7 @@ class AccountWorker:
                     notification_history,
                     account=self.name,
                     account_username=self.telegram_username,
+                    account_display_name=self.telegram_display_name,
                     manager_username=self.cfg.manager_username,
                 )
                 already_notified = (
@@ -492,6 +502,7 @@ class AccountWorker:
                     notification_history,
                     account=self.name,
                     account_username=self.telegram_username,
+                    account_display_name=self.telegram_display_name,
                     manager_username=self.cfg.manager_username,
                     delivery_note=delivery_note,
                 )

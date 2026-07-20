@@ -479,6 +479,7 @@ def manager_notification_text(
     history_text,
     account=None,
     account_username=None,
+    account_display_name=None,
     manager_username=None,
     delivery_note="",
 ):
@@ -488,8 +489,8 @@ def manager_notification_text(
     confidence = clamp_confidence(decision.get("confidence"))
     if account_username:
         account_label = f"@{account_username.lstrip('@')}"
-        if account:
-            account_label += f" ({account})"
+    elif account_display_name:
+        account_label = account_display_name
     else:
         account_label = account or ""
     account_line = (

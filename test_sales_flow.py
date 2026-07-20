@@ -538,7 +538,7 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         self.assertEqual(len(self.notifier.notifications), 1)
         self.assertEqual(len(self.worker.client.sent_messages), 1)
         self.assertIn(
-            "Аккаунт, который общался: @sender_login (main)",
+            "Аккаунт, который общался: @sender_login",
             self.notifier.notifications[0],
         )
         self.assertIn(
@@ -550,6 +550,24 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         directions = [t["direction"] for t in transcript]
         self.assertIn("event", directions)
         self.assertIn("out", directions)
+
+    def test_notification_uses_profile_name_when_username_is_missing(self):
+        self.worker.telegram_username = None
+        self.worker.telegram_display_name = "Иван Петров"
+
+        asyncio.run(
+            self.worker.process_private_reply(12345, "lead123", "lead123")
+        )
+
+        notification = self.notifier.notifications[0]
+        self.assertIn(
+            "Аккаунт, который общался: Иван Петров",
+            notification,
+        )
+        self.assertNotIn(
+            "Аккаунт, который общался: main",
+            notification,
+        )
 
     def test_manager_notified_when_handoff_reply_fails(self):
         self.worker.client = FailingSendClient()
