@@ -526,6 +526,14 @@ def manager_notification_text(
 
 
 def extract_target_username(text):
+    labeled_match = re.search(
+        r"^\s*(?:юзернейм|username)\s*:\s*@([A-Za-z0-9_]{5,32})\s*$",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if labeled_match:
+        return labeled_match.group(1)
+
     separator = "────────────────────"
     parts = text.split(separator)
     for block in parts[1::2]:
@@ -546,4 +554,11 @@ def extract_lead_context(text):
     context_match = re.search(r"📄\s*Оригинал\n+(.*)", text, re.DOTALL)
     if context_match:
         return context_match.group(1).strip()
+    labeled_match = re.search(
+        r"^\s*(?:сообщение|message)\s*:\s*(.*)\Z",
+        text,
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    if labeled_match:
+        return labeled_match.group(1).strip()
     return text

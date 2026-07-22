@@ -319,9 +319,34 @@ class ExtractionTests(unittest.TestCase):
         text = "🔥 Новый лид\n👤 Иван (@ivan_lead)\nостальное"
         self.assertEqual(sales.extract_target_username(text), "ivan_lead")
 
+    def test_extract_target_username_from_labeled_format(self):
+        text = (
+            "юзернейм: @Aidar0018\n"
+            "источник: Чат Русского Маркетинга\n"
+            "тег: #конкуренты\n"
+            "сообщение: Ищу подрядчика"
+        )
+        self.assertEqual(sales.extract_target_username(text), "Aidar0018")
+
+    def test_labeled_format_without_public_username_is_skipped(self):
+        text = "юзернейм: Наталья\nсообщение: Ищу партнёров"
+        self.assertIsNone(sales.extract_target_username(text))
+
     def test_extract_lead_context(self):
         text = "заголовок\n📄 Оригинал\n\nищу инструмент для лидов"
         self.assertEqual(sales.extract_lead_context(text), "ищу инструмент для лидов")
+
+    def test_extract_lead_context_from_labeled_format(self):
+        text = (
+            "юзернейм: @lead_user\n"
+            "источник: Чат\n"
+            "тег: #лиды\n"
+            "сообщение: Первая строка\n\nВторая строка"
+        )
+        self.assertEqual(
+            sales.extract_lead_context(text),
+            "Первая строка\n\nВторая строка",
+        )
 
 
 class ExplicitNegativeGuardTests(unittest.TestCase):
