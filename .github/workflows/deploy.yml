@@ -58,6 +58,24 @@ jobs:
           API_ID_ACC08: ${{ secrets.API_ID_ACC08 }}
           API_HASH_ACC08: ${{ secrets.API_HASH_ACC08 }}
           SESSION_ACC08: ${{ secrets.SESSION_ACC08 }}
+          API_ID_ACC09: ${{ secrets.API_ID_ACC09 }}
+          API_HASH_ACC09: ${{ secrets.API_HASH_ACC09 }}
+          SESSION_ACC09: ${{ secrets.SESSION_ACC09 }}
+          API_ID_ACC12: ${{ secrets.API_ID_ACC12 }}
+          API_HASH_ACC12: ${{ secrets.API_HASH_ACC12 }}
+          SESSION_ACC12: ${{ secrets.SESSION_ACC12 }}
+          API_ID_ACC13: ${{ secrets.API_ID_ACC13 }}
+          API_HASH_ACC13: ${{ secrets.API_HASH_ACC13 }}
+          SESSION_ACC13: ${{ secrets.SESSION_ACC13 }}
+          API_ID_ACC15: ${{ secrets.API_ID_ACC15 }}
+          API_HASH_ACC15: ${{ secrets.API_HASH_ACC15 }}
+          SESSION_ACC15: ${{ secrets.SESSION_ACC15 }}
+          API_ID_ACC16: ${{ secrets.API_ID_ACC16 }}
+          API_HASH_ACC16: ${{ secrets.API_HASH_ACC16 }}
+          SESSION_ACC16: ${{ secrets.SESSION_ACC16 }}
+          API_ID_ACC17: ${{ secrets.API_ID_ACC17 }}
+          API_HASH_ACC17: ${{ secrets.API_HASH_ACC17 }}
+          SESSION_ACC17: ${{ secrets.SESSION_ACC17 }}
           TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           BOT_CHAT_ID: ${{ secrets.BOT_CHAT_ID }}
@@ -73,7 +91,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          envs: API_ID,API_HASH,SESSION,API_ID_PERSONAL,API_HASH_PERSONAL,SESSION_PERSONAL,API_ID_ACC01,API_HASH_ACC01,SESSION_ACC01,API_ID_ACC02,API_HASH_ACC02,SESSION_ACC02,API_ID_ACC03,API_HASH_ACC03,SESSION_ACC03,API_ID_ACC14,API_HASH_ACC14,SESSION_ACC14,API_ID_ACC04,API_HASH_ACC04,SESSION_ACC04,API_ID_ACC05,API_HASH_ACC05,SESSION_ACC05,API_ID_ACC06,API_HASH_ACC06,SESSION_ACC06,API_ID_ACC07,API_HASH_ACC07,SESSION_ACC07,API_ID_ACC08,API_HASH_ACC08,SESSION_ACC08,TARGET_CHAT,BOT_TOKEN,BOT_CHAT_ID,PROXY_URL,LLM_PROVIDER,OPENROUTER_API_KEY,OPENROUTER_MODEL,YANDEX_CLOUD_FOLDER,YANDEX_CLOUD_API_KEY,YANDEX_CLOUD_MODEL,LLM_FALLBACK_PROVIDER
+          envs: API_ID,API_HASH,SESSION,API_ID_PERSONAL,API_HASH_PERSONAL,SESSION_PERSONAL,API_ID_ACC01,API_HASH_ACC01,SESSION_ACC01,API_ID_ACC02,API_HASH_ACC02,SESSION_ACC02,API_ID_ACC03,API_HASH_ACC03,SESSION_ACC03,API_ID_ACC14,API_HASH_ACC14,SESSION_ACC14,API_ID_ACC04,API_HASH_ACC04,SESSION_ACC04,API_ID_ACC05,API_HASH_ACC05,SESSION_ACC05,API_ID_ACC06,API_HASH_ACC06,SESSION_ACC06,API_ID_ACC07,API_HASH_ACC07,SESSION_ACC07,API_ID_ACC08,API_HASH_ACC08,SESSION_ACC08,API_ID_ACC09,API_HASH_ACC09,SESSION_ACC09,API_ID_ACC12,API_HASH_ACC12,SESSION_ACC12,API_ID_ACC13,API_HASH_ACC13,SESSION_ACC13,API_ID_ACC15,API_HASH_ACC15,SESSION_ACC15,API_ID_ACC16,API_HASH_ACC16,SESSION_ACC16,API_ID_ACC17,API_HASH_ACC17,SESSION_ACC17,TARGET_CHAT,BOT_TOKEN,BOT_CHAT_ID,PROXY_URL,LLM_PROVIDER,OPENROUTER_API_KEY,OPENROUTER_MODEL,YANDEX_CLOUD_FOLDER,YANDEX_CLOUD_API_KEY,YANDEX_CLOUD_MODEL,LLM_FALLBACK_PROVIDER
           script: |
             set -eu
             cd ~/.hermes
@@ -128,6 +146,12 @@ jobs:
               API_ID_ACC06 API_HASH_ACC06 SESSION_ACC06 \
               API_ID_ACC07 API_HASH_ACC07 SESSION_ACC07 \
               API_ID_ACC08 API_HASH_ACC08 SESSION_ACC08 \
+              API_ID_ACC09 API_HASH_ACC09 SESSION_ACC09 \
+              API_ID_ACC12 API_HASH_ACC12 SESSION_ACC12 \
+              API_ID_ACC13 API_HASH_ACC13 SESSION_ACC13 \
+              API_ID_ACC15 API_HASH_ACC15 SESSION_ACC15 \
+              API_ID_ACC16 API_HASH_ACC16 SESSION_ACC16 \
+              API_ID_ACC17 API_HASH_ACC17 SESSION_ACC17 \
               TARGET_CHAT BOT_TOKEN BOT_CHAT_ID PROXY_URL \
               LLM_PROVIDER OPENROUTER_API_KEY OPENROUTER_MODEL \
               YANDEX_CLOUD_FOLDER YANDEX_CLOUD_API_KEY YANDEX_CLOUD_MODEL \
@@ -190,6 +214,26 @@ jobs:
             fi
             if has_env_value API_ID_ACC08 && has_env_value API_HASH_ACC08 && has_env_value SESSION_ACC08; then
               append_account acc08 API_ID_ACC08 API_HASH_ACC08 SESSION_ACC08 MaksIgitov 3
+            fi
+
+            # Order-772563 remaining live accounts
+            if has_env_value API_ID_ACC09 && has_env_value API_HASH_ACC09 && has_env_value SESSION_ACC09; then
+              append_account acc09 API_ID_ACC09 API_HASH_ACC09 SESSION_ACC09 andrew_pontific 3
+            fi
+            if has_env_value API_ID_ACC12 && has_env_value API_HASH_ACC12 && has_env_value SESSION_ACC12; then
+              append_account acc12 API_ID_ACC12 API_HASH_ACC12 SESSION_ACC12 MaksIgitov 3
+            fi
+            if has_env_value API_ID_ACC13 && has_env_value API_HASH_ACC13 && has_env_value SESSION_ACC13; then
+              append_account acc13 API_ID_ACC13 API_HASH_ACC13 SESSION_ACC13 MaksIgitov 3
+            fi
+            if has_env_value API_ID_ACC15 && has_env_value API_HASH_ACC15 && has_env_value SESSION_ACC15; then
+              append_account acc15 API_ID_ACC15 API_HASH_ACC15 SESSION_ACC15 MaksIgitov 3
+            fi
+            if has_env_value API_ID_ACC16 && has_env_value API_HASH_ACC16 && has_env_value SESSION_ACC16; then
+              append_account acc16 API_ID_ACC16 API_HASH_ACC16 SESSION_ACC16 MaksIgitov 3
+            fi
+            if has_env_value API_ID_ACC17 && has_env_value API_HASH_ACC17 && has_env_value SESSION_ACC17; then
+              append_account acc17 API_ID_ACC17 API_HASH_ACC17 SESSION_ACC17 MaksIgitov 3
             fi
 
             if [ "$(grep -c 'name:' accounts.yaml)" -eq 0 ]; then
