@@ -43,6 +43,18 @@ jobs:
           API_ID_ACC14: ${{ secrets.API_ID_ACC14 }}
           API_HASH_ACC14: ${{ secrets.API_HASH_ACC14 }}
           SESSION_ACC14: ${{ secrets.SESSION_ACC14 }}
+          API_ID_ACC04: ${{ secrets.API_ID_ACC04 }}
+          API_HASH_ACC04: ${{ secrets.API_HASH_ACC04 }}
+          SESSION_ACC04: ${{ secrets.SESSION_ACC04 }}
+          API_ID_ACC05: ${{ secrets.API_ID_ACC05 }}
+          API_HASH_ACC05: ${{ secrets.API_HASH_ACC05 }}
+          SESSION_ACC05: ${{ secrets.SESSION_ACC05 }}
+          API_ID_ACC06: ${{ secrets.API_ID_ACC06 }}
+          API_HASH_ACC06: ${{ secrets.API_HASH_ACC06 }}
+          SESSION_ACC06: ${{ secrets.SESSION_ACC06 }}
+          API_ID_ACC07: ${{ secrets.API_ID_ACC07 }}
+          API_HASH_ACC07: ${{ secrets.API_HASH_ACC07 }}
+          SESSION_ACC07: ${{ secrets.SESSION_ACC07 }}
           TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           BOT_CHAT_ID: ${{ secrets.BOT_CHAT_ID }}
@@ -58,7 +70,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          envs: API_ID,API_HASH,SESSION,API_ID_PERSONAL,API_HASH_PERSONAL,SESSION_PERSONAL,API_ID_ACC01,API_HASH_ACC01,SESSION_ACC01,API_ID_ACC02,API_HASH_ACC02,SESSION_ACC02,API_ID_ACC03,API_HASH_ACC03,SESSION_ACC03,API_ID_ACC14,API_HASH_ACC14,SESSION_ACC14,TARGET_CHAT,BOT_TOKEN,BOT_CHAT_ID,PROXY_URL,LLM_PROVIDER,OPENROUTER_API_KEY,OPENROUTER_MODEL,YANDEX_CLOUD_FOLDER,YANDEX_CLOUD_API_KEY,YANDEX_CLOUD_MODEL,LLM_FALLBACK_PROVIDER
+          envs: API_ID,API_HASH,SESSION,API_ID_PERSONAL,API_HASH_PERSONAL,SESSION_PERSONAL,API_ID_ACC01,API_HASH_ACC01,SESSION_ACC01,API_ID_ACC02,API_HASH_ACC02,SESSION_ACC02,API_ID_ACC03,API_HASH_ACC03,SESSION_ACC03,API_ID_ACC14,API_HASH_ACC14,SESSION_ACC14,API_ID_ACC04,API_HASH_ACC04,SESSION_ACC04,API_ID_ACC05,API_HASH_ACC05,SESSION_ACC05,API_ID_ACC06,API_HASH_ACC06,SESSION_ACC06,API_ID_ACC07,API_HASH_ACC07,SESSION_ACC07,TARGET_CHAT,BOT_TOKEN,BOT_CHAT_ID,PROXY_URL,LLM_PROVIDER,OPENROUTER_API_KEY,OPENROUTER_MODEL,YANDEX_CLOUD_FOLDER,YANDEX_CLOUD_API_KEY,YANDEX_CLOUD_MODEL,LLM_FALLBACK_PROVIDER
           script: |
             set -eu
             cd ~/.hermes
@@ -108,6 +120,10 @@ jobs:
               API_ID_ACC02 API_HASH_ACC02 SESSION_ACC02 \
               API_ID_ACC03 API_HASH_ACC03 SESSION_ACC03 \
               API_ID_ACC14 API_HASH_ACC14 SESSION_ACC14 \
+              API_ID_ACC04 API_HASH_ACC04 SESSION_ACC04 \
+              API_ID_ACC05 API_HASH_ACC05 SESSION_ACC05 \
+              API_ID_ACC06 API_HASH_ACC06 SESSION_ACC06 \
+              API_ID_ACC07 API_HASH_ACC07 SESSION_ACC07 \
               TARGET_CHAT BOT_TOKEN BOT_CHAT_ID PROXY_URL \
               LLM_PROVIDER OPENROUTER_API_KEY OPENROUTER_MODEL \
               YANDEX_CLOUD_FOLDER YANDEX_CLOUD_API_KEY YANDEX_CLOUD_MODEL \
@@ -153,6 +169,20 @@ jobs:
             if has_env_value API_ID_ACC14 && has_env_value API_HASH_ACC14 && has_env_value SESSION_ACC14; then
               append_account acc14 API_ID_ACC14 API_HASH_ACC14 SESSION_ACC14 MaksIgitov 3
               printf '%s\n' '    enabled: false' >> accounts.yaml
+            fi
+
+            # Order-785793 working accounts: 2 -> Andrew, 2 -> Maks
+            if has_env_value API_ID_ACC04 && has_env_value API_HASH_ACC04 && has_env_value SESSION_ACC04; then
+              append_account acc04 API_ID_ACC04 API_HASH_ACC04 SESSION_ACC04 andrew_pontific 3
+            fi
+            if has_env_value API_ID_ACC05 && has_env_value API_HASH_ACC05 && has_env_value SESSION_ACC05; then
+              append_account acc05 API_ID_ACC05 API_HASH_ACC05 SESSION_ACC05 andrew_pontific 3
+            fi
+            if has_env_value API_ID_ACC06 && has_env_value API_HASH_ACC06 && has_env_value SESSION_ACC06; then
+              append_account acc06 API_ID_ACC06 API_HASH_ACC06 SESSION_ACC06 MaksIgitov 3
+            fi
+            if has_env_value API_ID_ACC07 && has_env_value API_HASH_ACC07 && has_env_value SESSION_ACC07; then
+              append_account acc07 API_ID_ACC07 API_HASH_ACC07 SESSION_ACC07 MaksIgitov 3
             fi
 
             if [ "$(grep -c 'name:' accounts.yaml)" -eq 0 ]; then
