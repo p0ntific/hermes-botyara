@@ -205,6 +205,7 @@ jobs:
             fi
             if has_env_value API_ID_ACC05 && has_env_value API_HASH_ACC05 && has_env_value SESSION_ACC05; then
               append_account acc05 API_ID_ACC05 API_HASH_ACC05 SESSION_ACC05 andrew_pontific 3
+              printf '%s\n' '    enabled: false' >> accounts.yaml
             fi
             if has_env_value API_ID_ACC06 && has_env_value API_HASH_ACC06 && has_env_value SESSION_ACC06; then
               append_account acc06 API_ID_ACC06 API_HASH_ACC06 SESSION_ACC06 MaksIgitov 3
