@@ -89,6 +89,9 @@ class Settings:
     db_path: str
     legacy_json_path: str
     accounts_file: str
+    outreach_timezone: str = "Europe/Moscow"
+    outreach_quiet_start_hour: int = 20
+    outreach_quiet_end_hour: int = 9
 
 
 def load_settings():
@@ -112,6 +115,9 @@ def load_settings():
         db_path=os.getenv("HERMES_DB", "hermes.db"),
         legacy_json_path=os.getenv("DB_FILE", "mtproto_leads.json"),
         accounts_file=os.getenv("ACCOUNTS_FILE", "accounts.yaml"),
+        outreach_timezone=os.getenv("OUTREACH_TIMEZONE", "Europe/Moscow"),
+        outreach_quiet_start_hour=_int_env("OUTREACH_QUIET_START_HOUR", 20),
+        outreach_quiet_end_hour=_int_env("OUTREACH_QUIET_END_HOUR", 9),
     )
 
 

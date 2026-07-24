@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from . import sales
+from .schedule import is_outreach_allowed
 from .worker import PitchRetryable
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ class Dispatcher:
 
     async def _dispatch_once(self):
         if self.store.pending_count() == 0:
+            return False
+        if not is_outreach_allowed(self.settings):
             return False
         worker = self.pick_worker()
         if worker is None:

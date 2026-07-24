@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import os
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from hermes.dashboard import Handler, qr_svg
 from hermes.dispatcher import Dispatcher
 from hermes.llm import LLMRouter, LLMUnavailable
 from hermes.notify import AdminNotifier
+from hermes.schedule import is_outreach_allowed, seconds_until_outreach
 from hermes.store import Store
 from hermes.worker import AccountWorker
 from test_sales_flow import make_settings
@@ -98,6 +100,7 @@ accounts:
         self.assertEqual(accounts[0].manager_username, "andrew_pontific")
         self.assertEqual(accounts[0].cold_dm_daily_limit, 3)
         self.assertEqual(accounts[0].proxy_url, "socks5h://127.0.0.1:9051")
+
         self.assertEqual(accounts[1].manager_username, settings.manager_username)
         self.assertEqual(accounts[1].proxy_url, "socks5h://127.0.0.1:9052")
         self.assertEqual(accounts[1].proxy, {"proxy_type": "socks5", "addr": "127.0.0.1", "port": 9052})
@@ -135,6 +138,55 @@ accounts:
             settings = config.load_settings()
             with self.assertRaises(ValueError):
                 config.load_accounts(settings)
+
+
+class OutreachScheduleTests(unittest.TestCase):
+    def test_moscow_quiet_hours_wrap_across_midnight(self):
+        settings = make_settings(
+            outreach_quiet_start_hour=20,
+            outreach_quiet_end_hour=9,
+        )
+        timezone = datetime.timezone(datetime.timedelta(hours=3))
+
+        self.assertTrue(
+            is_outreach_allowed(
+                settings,
+                datetime.datetime(2026, 7, 25, 9, 0, tzinfo=timezone),
+            )
+        )
+        self.assertTrue(
+            is_outreach_allowed(
+                settings,
+                datetime.datetime(2026, 7, 25, 19, 59, tzinfo=timezone),
+            )
+        )
+        self.assertFalse(
+            is_outreach_allowed(
+                settings,
+                datetime.datetime(2026, 7, 25, 20, 0, tzinfo=timezone),
+            )
+        )
+        self.assertFalse(
+            is_outreach_allowed(
+                settings,
+                datetime.datetime(2026, 7, 26, 8, 59, tzinfo=timezone),
+            )
+        )
+
+    def test_seconds_until_outreach_returns_moscow_nine_am(self):
+        settings = make_settings(
+            outreach_quiet_start_hour=20,
+            outreach_quiet_end_hour=9,
+        )
+        timezone = datetime.timezone(datetime.timedelta(hours=3))
+
+        self.assertEqual(
+            seconds_until_outreach(
+                settings,
+                datetime.datetime(2026, 7, 25, 23, 30, tzinfo=timezone),
+            ),
+            9 * 60 * 60 + 30 * 60,
+        )
 
 
 class DashboardSecurityTests(unittest.TestCase):
@@ -839,6 +891,16 @@ class AdminNotifierTests(unittest.TestCase):
 
 
 class AccountWorkerQueueTests(TempStoreMixin, unittest.TestCase):
+    def test_quiet_hours_account_has_no_capacity(self):
+        store = self.make_store()
+        store.ensure_account("main")
+        cfg = config.AccountConfig(name="main", api_id=1, api_hash="hash", session="session")
+        worker = AccountWorker(cfg, make_settings(), store, _FakeBrain(), _FakeNotifier())
+        worker.is_connected = lambda: True
+
+        with mock.patch("hermes.worker.is_outreach_allowed", return_value=False):
+            self.assertFalse(worker.has_capacity())
+
     def test_disabled_account_has_no_capacity(self):
         store = self.make_store()
         store.ensure_account("main")
@@ -863,6 +925,18 @@ class AccountWorkerQueueTests(TempStoreMixin, unittest.TestCase):
 
 
 class DispatcherTests(TempStoreMixin, unittest.TestCase):
+    def test_dispatcher_keeps_lead_pending_during_quiet_hours(self):
+        store = self.make_store()
+        store.ensure_account("a")
+        store.enqueue_lead("lead_x", "ctx")
+        dispatcher = Dispatcher(store, [_StubWorker("a")], make_settings())
+
+        with mock.patch("hermes.dispatcher.is_outreach_allowed", return_value=False):
+            dispatched = asyncio.run(dispatcher._dispatch_once())
+
+        self.assertFalse(dispatched)
+        self.assertEqual(store.pending_count(), 1)
+
     def test_pick_worker_prefers_least_recently_dispatched(self):
         store = self.make_store()
         for name in ("a", "b"):

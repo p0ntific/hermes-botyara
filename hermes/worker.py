@@ -6,6 +6,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 
 from . import sales
+from .schedule import is_outreach_allowed, wait_for_outreach_window
 from .sales import TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,8 @@ class AccountWorker:
     def has_capacity(self):
         if not self.store.account_enabled(self.name):
             return False
+        if not is_outreach_allowed(self.settings):
+            return False
         if not self.is_connected() or self.pitch_lock.locked():
             return False
         if self.store.get_cooldown_remaining(self.name) > 0:
@@ -175,6 +178,9 @@ class AccountWorker:
             )
             logger.info(f"[{self.name}] sleeping for {delay}s before pitching @{target_user}...")
             await asyncio.sleep(delay)
+
+            if not is_outreach_allowed(self.settings):
+                raise PitchRetryable("outside Moscow outreach hours")
 
             if not self.store.account_enabled(self.name):
                 raise PitchRetryable(f"account {self.name} disabled")
@@ -336,6 +342,7 @@ class AccountWorker:
         lock_acquired = False
         try:
             await asyncio.sleep(self.settings.incoming_reply_debounce_seconds)
+            await wait_for_outreach_window(self.settings)
             if task_state is not None:
                 task_state["processing"] = True
             reply_lock = self.reply_locks.setdefault(target_key, asyncio.Lock())
@@ -441,6 +448,7 @@ class AccountWorker:
             reply_error = None
             if reply_text.strip():
                 try:
+                    await wait_for_outreach_window(self.settings)
                     await self.client.send_message(chat_id, reply_text)
                     reply_sent = True
                 except errors.FloodWaitError as e:

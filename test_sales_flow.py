@@ -64,6 +64,9 @@ def make_settings(**overrides):
         db_path=":memory:",
         legacy_json_path="",
         accounts_file="",
+        outreach_timezone="Europe/Moscow",
+        outreach_quiet_start_hour=0,
+        outreach_quiet_end_hour=0,
     )
     values.update(overrides)
     return Settings(**values)
