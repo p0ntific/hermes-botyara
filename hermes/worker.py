@@ -115,6 +115,7 @@ class AccountWorker:
                 self._lead_feed_handler, events.NewMessage(chats=self.settings.target_chat)
             )
         self.client.add_event_handler(self._pm_handler, events.NewMessage(incoming=True))
+        self.client.add_event_handler(self._read_handler, events.MessageRead())
 
     # --- capacity ---------------------------------------------------------
 
@@ -204,7 +205,7 @@ class AccountWorker:
                 # Persist before the network send so a crash after Telegram accepts
                 # the message cannot cause another account to cold-pitch this lead.
                 self.store.add_contacted(target_user, self.name, "pitching")
-                await self.client.send_message(target_user, pitch_message)
+                sent_message = await self.client.send_message(target_user, pitch_message)
             except errors.FloodWaitError as e:
                 self.store.remove_lead_if_status(target_user, self.name, "pitching")
                 logger.error(f"[{self.name}] flood wait error. Must wait {e.seconds} seconds.")
@@ -269,12 +270,21 @@ class AccountWorker:
                 return "failed"
 
             self.store.add_contacted(target_user, self.name, "sent")
+            self.store.track_pitch(
+                target_user,
+                getattr(sent_message, "chat_id", None),
+                getattr(sent_message, "id", None),
+            )
             self.store.finish_queue(target_user, "done")
             self.store.record_message(target_user, self.name, "out", pitch_message, meta={"kind": "pitch"})
             logger.info(f"[{self.name}] successfully pitched @{target_user}")
             return "sent"
 
     # --- private replies -----------------------------------------------------
+
+    async def _read_handler(self, event):
+        if event.chat_id is not None and event.max_id is not None:
+            self.store.mark_read_receipt(self.name, event.chat_id, event.max_id)
 
     async def _pm_handler(self, event):
         if not event.is_private or not self.store.account_enabled(self.name):
@@ -303,6 +313,7 @@ class AccountWorker:
                 pass
 
         logger.info(f"[{self.name}] queued reply from {sender_username}: {event.raw_text}")
+        self.store.mark_read(target_key)
         self.store.record_message(target_key, self.name, "in", event.raw_text)
 
         state = self.pending_reply_tasks.get(target_key)

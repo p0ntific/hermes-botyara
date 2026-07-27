@@ -5,6 +5,7 @@ import sqlite3
 import datetime
 import threading
 import logging
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,8 @@ CREATE TABLE IF NOT EXISTS leads (
     last_action TEXT,
     manager_notified_at REAL,
     last_notified_action TEXT,
+    pitch_message_id INTEGER,
+    read_at REAL,
     stop_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS queue (
@@ -120,6 +123,8 @@ class Store:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
             self._ensure_column("leads", "last_notified_action", "TEXT")
+            self._ensure_column("leads", "pitch_message_id", "INTEGER")
+            self._ensure_column("leads", "read_at", "REAL")
             self._conn.execute(
                 """UPDATE leads
                    SET last_notified_action=last_action
@@ -320,6 +325,36 @@ class Store:
                 "UPDATE leads SET peer_id=? WHERE lead_key=?", (peer_id, lead_key)
             )
             self._conn.commit()
+
+    def track_pitch(self, lead_key, peer_id, message_id):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._conn.execute(
+                """UPDATE leads SET peer_id=COALESCE(?, peer_id), pitch_message_id=?
+                   WHERE lead_key=?""",
+                (peer_id, message_id, lead_key),
+            )
+            self._conn.commit()
+
+    def mark_read(self, lead_key):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE leads SET read_at=COALESCE(read_at, ?) WHERE lead_key=?",
+                (time.time(), lead_key),
+            )
+            self._conn.commit()
+
+    def mark_read_receipt(self, account, peer_id, max_message_id):
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE leads SET read_at=COALESCE(read_at, ?)
+                   WHERE account=? AND peer_id=? AND pitch_message_id IS NOT NULL
+                     AND pitch_message_id<=?""",
+                (time.time(), account, peer_id, max_message_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def reset_reply_count_if_new_day(self, lead_key):
         lead_key = _lead_key(lead_key)
@@ -914,3 +949,77 @@ class Store:
                 "dropped": int(statuses.get("stopped", 0)),
                 "warm": int(statuses.get("warm_notified", 0)),
             }
+
+    def funnel_timeseries(self, date_from, date_to, account=None):
+        timezone = ZoneInfo("Europe/Moscow")
+        start = datetime.datetime.combine(
+            date_from, datetime.time.min, timezone
+        ).timestamp()
+        end = datetime.datetime.combine(
+            date_to + datetime.timedelta(days=1), datetime.time.min, timezone
+        ).timestamp()
+        params = [start, end]
+        account_sql = ""
+        if account:
+            account_sql = " AND l.account=?"
+            params.append(account)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT l.timestamp AS pitched_at, l.read_at,
+                           l.manager_notified_at, l.last_notified_action,
+                           COUNT(i.id) AS inbound_count
+                    FROM leads l
+                    LEFT JOIN transcripts i
+                      ON i.lead_key=l.lead_key AND i.direction='in'
+                    WHERE l.timestamp>=? AND l.timestamp<?{account_sql}
+                      AND EXISTS (
+                        SELECT 1 FROM transcripts p
+                        WHERE p.lead_key=l.lead_key AND p.direction='out'
+                          AND p.meta LIKE '%"kind": "pitch"%'
+                      )
+                    GROUP BY l.lead_key
+                    ORDER BY l.timestamp""",
+                params,
+            ).fetchall()
+
+        days = {}
+        day = date_from
+        while day <= date_to:
+            days[day.isoformat()] = {
+                "date": day.isoformat(),
+                "sent": 0,
+                "read": 0,
+                "first_reply": 0,
+                "second_reply": 0,
+                "recommendation": 0,
+            }
+            day += datetime.timedelta(days=1)
+
+        for row in rows:
+            key = datetime.datetime.fromtimestamp(
+                row["pitched_at"], timezone
+            ).date().isoformat()
+            bucket = days[key]
+            inbound_count = int(row["inbound_count"])
+            bucket["sent"] += 1
+            bucket["read"] += int(bool(row["read_at"]) or inbound_count >= 1)
+            bucket["first_reply"] += int(inbound_count >= 1)
+            bucket["second_reply"] += int(inbound_count >= 2)
+            bucket["recommendation"] += int(
+                bool(row["manager_notified_at"])
+                and row["last_notified_action"] == "handoff_to_manager"
+            )
+
+        totals = {
+            key: sum(bucket[key] for bucket in days.values())
+            for key in ("sent", "read", "first_reply", "second_reply", "recommendation")
+        }
+        for bucket in days.values():
+            sent = bucket["sent"]
+            for key in ("read", "first_reply", "second_reply", "recommendation"):
+                bucket[f"{key}_cr"] = round(bucket[key] * 100 / sent, 1) if sent else None
+        totals["rates"] = {
+            key: round(totals[key] * 100 / totals["sent"], 1) if totals["sent"] else 0
+            for key in ("read", "first_reply", "second_reply", "recommendation")
+        }
+        return {"series": list(days.values()), "totals": totals}

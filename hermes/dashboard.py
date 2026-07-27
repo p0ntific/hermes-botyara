@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import html
 import os
 import secrets
@@ -8,7 +9,8 @@ import threading
 import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
+from zoneinfo import ZoneInfo
 
 import qrcode
 import yaml
@@ -34,6 +36,59 @@ STAGES = {
     "unknown": "Не определён",
     "без этапа": "Без этапа",
 }
+FUNNEL_METRICS = (
+    ("read", "CR до прочтения", "#147d64"),
+    ("first_reply", "CR до первого ответа", "#df7b35"),
+    ("second_reply", "CR до второго ответа", "#3478c9"),
+    ("recommendation", "CR в рекомендацию", "#be4b67"),
+)
+
+
+def funnel_svg(series):
+    width, height = 920, 360
+    left, right, top, bottom = 54, 18, 18, 42
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    x = lambda index: left + (plot_width * index / max(1, len(series) - 1))
+    y = lambda value: top + plot_height * (100 - value) / 100
+    parts = [
+        f'<svg class="chart" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Конверсия воронки по дням">'
+    ]
+    for value in (0, 25, 50, 75, 100):
+        position = y(value)
+        parts.append(
+            f'<line class="grid" x1="{left}" y1="{position}" x2="{width-right}" y2="{position}"/>'
+            f'<text class="axis-y" x="{left-9}" y="{position+4}">{value}%</text>'
+        )
+    label_step = max(1, (len(series) + 5) // 6)
+    for index, bucket in enumerate(series):
+        if index % label_step == 0 or index == len(series) - 1:
+            label = datetime.date.fromisoformat(bucket["date"]).strftime("%d.%m")
+            parts.append(
+                f'<text class="axis-x" x="{x(index):.1f}" y="{height-12}">{label}</text>'
+            )
+    for key, label, color in FUNNEL_METRICS:
+        points = [
+            (index, bucket[f"{key}_cr"])
+            for index, bucket in enumerate(series)
+            if bucket[f"{key}_cr"] is not None
+        ]
+        if not points:
+            continue
+        path = " ".join(
+            f'{"M" if point_index == 0 else "L"} {x(index):.1f} {y(value):.1f}'
+            for point_index, (index, value) in enumerate(points)
+        )
+        parts.append(f'<path class="series" d="{path}" stroke="{color}"/>')
+        for index, value in points:
+            date = datetime.date.fromisoformat(series[index]["date"]).strftime("%d.%m.%Y")
+            parts.append(
+                f'<circle cx="{x(index):.1f}" cy="{y(value):.1f}" r="3.5" fill="{color}">'
+                f"<title>{html.escape(label)} · {date}: {value:g}%</title></circle>"
+            )
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def service_active():
@@ -156,9 +211,25 @@ class Dashboard:
         os.chmod(temp_path, 0o600)
         os.replace(temp_path, path)
 
-    def render(self):
+    def render(self, account=None, date_from=None, date_to=None):
         snapshot = self.store.dashboard_snapshot()
         configs = self.accounts()
+        today = datetime.datetime.now(ZoneInfo("Europe/Moscow")).date()
+        date_to = date_to or today
+        date_from = date_from or date_to - datetime.timedelta(days=29)
+        funnel = self.store.funnel_timeseries(date_from, date_to, account)
+        totals = funnel["totals"]
+        account_options = ['<option value="">Все агенты</option>'] + [
+            f'<option value="{html.escape(name)}"{" selected" if name == account else ""}>'
+            f"{html.escape(name)}</option>"
+            for name in configs
+        ]
+        funnel_metrics = "".join(
+            f'<div class="funnel-metric" style="--accent:{color}">'
+            f'<span>{label}</span><b>{totals["rates"][key]:g}%</b>'
+            f'<small>{totals[key]} из {totals["sent"]}</small></div>'
+            for key, label, color in FUNNEL_METRICS
+        )
         active = service_active()
         by_name = {row["account"]: row for row in snapshot["accounts"]}
         account_rows = []
@@ -207,10 +278,11 @@ class Dashboard:
             qr_block = f'<p class="error">{html.escape(qr_status["error"])}</p>'
         return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{refresh}
 <title>Pulsar</title><style>
-:root{{--ink:#17201d;--paper:#f3f1e8;--line:#d6d2c4;--green:#1d7a51;--red:#a63b32;--amber:#b27818}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:16px Georgia,serif}}main{{max-width:980px;margin:auto;padding:56px 24px 80px}}header{{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--ink);padding-bottom:18px}}h1{{font-size:30px;margin:0;letter-spacing:-1px}}button,input{{font:inherit}}button{{background:transparent;border:1px solid var(--ink);padding:8px 12px;cursor:pointer}}button:hover{{background:var(--ink);color:var(--paper)}}.switch button{{border-color:{'var(--red)' if active else 'var(--green)'};color:{'var(--red)' if active else 'var(--green)'}}}.metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);margin:28px 0}}.metric{{background:var(--paper);padding:22px 18px}}.metric b{{display:block;font-size:36px;font-weight:normal}}.metric span{{font-size:13px;text-transform:uppercase;letter-spacing:.08em}}section{{margin-top:38px}}h2{{font-size:13px;text-transform:uppercase;letter-spacing:.12em;margin:0 0 16px}}.account{{display:grid;grid-template-columns:12px 1fr 100px 170px 105px;gap:12px;align-items:center;border-top:1px solid var(--line);padding:12px 0}}.account label{{font-size:13px}}.account input{{width:70px;border:0;border-bottom:1px solid var(--ink);background:transparent;padding:5px}}.dot{{width:8px;height:8px;border-radius:50%;background:var(--red)}}.good{{background:var(--green)}}.wait{{background:var(--amber)}}.off{{background:#777}}.state{{font-size:13px;color:#666}}.bar{{display:grid;grid-template-columns:180px 1fr 40px;gap:15px;align-items:center;margin:11px 0}}.bar span{{font-size:14px}}.bar i{{height:9px;background:var(--green);transform:scaleX(var(--w));transform-origin:left}}.bar b{{font-weight:normal;text-align:right}}.qrline{{display:flex;gap:18px;align-items:flex-start}}.qrline svg{{width:260px;height:260px;background:white;padding:8px}}.password{{display:flex;gap:8px}}.password input{{padding:9px;background:white;border:1px solid var(--ink)}}.error{{color:var(--red);max-width:520px}}.success{{color:var(--green)}}@media(max-width:680px){{main{{padding:28px 16px}}.metrics{{grid-template-columns:repeat(2,1fr)}}.account{{grid-template-columns:12px 1fr 85px}}.account label{{grid-column:2}}.account button{{grid-column:3;grid-row:1/3}}.bar{{grid-template-columns:130px 1fr 30px}}}}
+:root{{--ink:#17201d;--paper:#f3f1e8;--line:#d6d2c4;--green:#1d7a51;--red:#a63b32;--amber:#b27818;--panel:#faf8f0}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:16px Georgia,serif}}main{{max-width:980px;margin:auto;padding:56px 24px 80px}}header{{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--ink);padding-bottom:18px}}h1{{font-size:30px;margin:0;letter-spacing:-1px}}button,input,select{{font:inherit}}button{{background:transparent;border:1px solid var(--ink);padding:8px 12px;cursor:pointer}}button:hover{{background:var(--ink);color:var(--paper)}}.switch button{{border-color:{'var(--red)' if active else 'var(--green)'};color:{'var(--red)' if active else 'var(--green)'}}}.metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);margin:28px 0}}.metric{{background:var(--paper);padding:22px 18px}}.metric b{{display:block;font-size:36px;font-weight:normal}}.metric span,h2{{font-size:13px;text-transform:uppercase;letter-spacing:.08em}}section{{margin-top:38px}}h2{{letter-spacing:.12em;margin:0 0 16px}}.funnel-head{{display:flex;align-items:end;justify-content:space-between;gap:24px;margin-bottom:18px}}.funnel-head h2{{margin:0}}.filters{{display:flex;gap:9px;align-items:end}}.filters label{{display:grid;gap:4px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#67675f}}.filters input,.filters select{{height:35px;border:1px solid var(--line);background:var(--panel);padding:6px 8px;color:var(--ink)}}.funnel-metrics{{display:grid;grid-template-columns:repeat(4,1fr);background:var(--ink);gap:1px;border:1px solid var(--ink)}}.funnel-metric{{position:relative;background:var(--panel);padding:18px 16px 16px;border-top:4px solid var(--accent)}}.funnel-metric span{{display:block;min-height:32px;font-size:12px;text-transform:uppercase;letter-spacing:.07em}}.funnel-metric span:before{{content:"";display:inline-block;width:18px;height:3px;margin:0 7px 3px 0;background:var(--accent)}}.funnel-metric b{{display:block;margin-top:8px;font-size:30px;font-weight:normal}}.funnel-metric small{{color:#72726a}}.chart-wrap{{margin-top:1px;background:var(--panel);border:1px solid var(--line);padding:16px 10px 2px;overflow:hidden}}.chart{{display:block;width:100%;height:auto;min-height:260px}}.grid{{stroke:#dedbd0;stroke-width:1}}.axis-y,.axis-x{{fill:#74736d;font:11px Georgia,serif}}.axis-y{{text-anchor:end}}.axis-x{{text-anchor:middle}}.series{{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}}.account{{display:grid;grid-template-columns:12px 1fr 100px 170px 105px;gap:12px;align-items:center;border-top:1px solid var(--line);padding:12px 0}}.account label{{font-size:13px}}.account input{{width:70px;border:0;border-bottom:1px solid var(--ink);background:transparent;padding:5px}}.dot{{width:8px;height:8px;border-radius:50%;background:var(--red)}}.good{{background:var(--green)}}.wait{{background:var(--amber)}}.off{{background:#777}}.state{{font-size:13px;color:#666}}.bar{{display:grid;grid-template-columns:180px 1fr 40px;gap:15px;align-items:center;margin:11px 0}}.bar span{{font-size:14px}}.bar i{{height:9px;background:var(--green);transform:scaleX(var(--w));transform-origin:left}}.bar b{{font-weight:normal;text-align:right}}.qrline{{display:flex;gap:18px;align-items:flex-start}}.qrline svg{{width:260px;height:260px;background:white;padding:8px}}.password{{display:flex;gap:8px}}.password input{{padding:9px;background:white;border:1px solid var(--ink)}}.error{{color:var(--red);max-width:520px}}.success{{color:var(--green)}}@media(max-width:680px){{main{{padding:28px 16px}}.metrics,.funnel-metrics{{grid-template-columns:repeat(2,1fr)}}.funnel-head{{align-items:stretch;flex-direction:column}}.filters{{display:grid;grid-template-columns:1fr 1fr}}.filters label:first-child{{grid-column:1/-1}}.filters button{{grid-column:1/-1}}.account{{grid-template-columns:12px 1fr 85px}}.account label{{grid-column:2}}.account button{{grid-column:3;grid-row:1/3}}.bar{{grid-template-columns:130px 1fr 30px}}}}
 </style></head><body><main><header><h1>Pulsar</h1><form class="switch" method="post" action="/agent"><input type="hidden" name="csrf" value="{self.csrf}"><button name="action" value="{'stop' if active else 'start'}">{'Остановить' if active else 'Запустить'}</button></form></header>
 <div class="metrics"><div class="metric"><b>{snapshot['received']}</b><span>поступило</span></div><div class="metric"><b>{snapshot['pending']}</b><span>в очереди</span></div><div class="metric"><b>{snapshot['dropped']}</b><span>выпало</span></div><div class="metric"><b>{snapshot['warm']}</b><span>тёплые</span></div></div>
-<section><h2>Аккаунты</h2>{''.join(account_rows)}</section><section><h2>Воронка</h2>{bars}</section>
+<section><div class="funnel-head"><h2>Конверсия воронки</h2><form class="filters" method="get"><label>Агент<select name="account">{''.join(account_options)}</select></label><label>С <input type="date" name="from" value="{date_from.isoformat()}" required></label><label>По <input type="date" name="to" value="{date_to.isoformat()}" required></label><button>Показать</button></form></div><div class="funnel-metrics">{funnel_metrics}</div><div class="chart-wrap">{funnel_svg(funnel["series"])}</div></section>
+<section><h2>Аккаунты</h2>{''.join(account_rows)}</section><section><h2>Стадии диалогов</h2>{bars}</section>
 <section><h2>Новый аккаунт</h2><div class="qrline"><form method="post" action="/qr/start"><input type="hidden" name="csrf" value="{self.csrf}"><button>Показать QR</button></form>{qr_block}</div></section>
 </main></body></html>'''
 
@@ -231,7 +303,8 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
-        if self.path == "/bootstrap":
+        parsed = urlsplit(self.path)
+        if parsed.path == "/bootstrap":
             if self.client_address[0] not in self.dashboard.bootstrap_ips:
                 self.send_error(403)
                 return
@@ -245,10 +318,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.require_auth():
             return
-        if self.path != "/":
+        if parsed.path != "/":
             self.send_error(404)
             return
-        body = self.dashboard.render().encode()
+        query = parse_qs(parsed.query, max_num_fields=8)
+        try:
+            account = query.get("account", [""])[0] or None
+            if account and account not in self.dashboard.accounts():
+                raise ValueError("unknown account")
+            date_from = (
+                datetime.date.fromisoformat(query["from"][0])
+                if query.get("from") else None
+            )
+            date_to = (
+                datetime.date.fromisoformat(query["to"][0])
+                if query.get("to") else None
+            )
+            if date_from and date_to and (
+                date_from > date_to
+                or (date_to - date_from).days > 3660
+            ):
+                raise ValueError("bad period")
+        except (ValueError, IndexError):
+            self.send_error(400, "bad funnel filters")
+            return
+        body = self.dashboard.render(account, date_from, date_to).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

@@ -39,7 +39,7 @@ if "telethon.sessions" not in sys.modules:
 
 from hermes import config
 from hermes.app import recover_orphaned_notifications
-from hermes.dashboard import Handler, qr_svg
+from hermes.dashboard import Handler, funnel_svg, qr_svg
 from hermes.dispatcher import Dispatcher
 from hermes.llm import LLMRouter, LLMUnavailable
 from hermes.notify import AdminNotifier
@@ -204,6 +204,19 @@ class DashboardSecurityTests(unittest.TestCase):
         svg = qr_svg("tg://login?token=secret")
         self.assertIn("<svg", svg)
         self.assertNotIn("secret", svg)
+
+    def test_funnel_chart_contains_all_four_series(self):
+        bucket = {
+            "date": "2026-07-01",
+            "read_cr": 80.0,
+            "first_reply_cr": 60.0,
+            "second_reply_cr": 40.0,
+            "recommendation_cr": 20.0,
+        }
+        svg = funnel_svg([bucket])
+
+        self.assertEqual(svg.count('class="series"'), 4)
+        self.assertIn("CR в рекомендацию · 01.07.2026: 20%", svg)
 
 
 class LLMRoutesConfigTests(unittest.TestCase):
@@ -450,6 +463,70 @@ class StoreQueueTests(TempStoreMixin, unittest.TestCase):
         self.assertEqual(snapshot["dropped"], 1)
         self.assertEqual(snapshot["warm"], 1)
         self.assertEqual(snapshot["accounts"][0]["enabled"], 0)
+
+    def test_funnel_timeseries_uses_pitch_cohorts_and_account_filter(self):
+        store = self.make_store()
+        timezone = datetime.timezone(datetime.timedelta(hours=3))
+        july_1 = datetime.datetime(2026, 7, 1, 12, tzinfo=timezone).timestamp()
+        july_2 = datetime.datetime(2026, 7, 2, 12, tzinfo=timezone).timestamp()
+
+        for lead, account, timestamp in (
+            ("read_twice", "main", july_1),
+            ("replied_once", "main", july_1),
+            ("unread", "personal", july_2),
+        ):
+            store.add_contacted(lead, account, "sent")
+            store.record_message(
+                lead, account, "out", "pitch", meta={"kind": "pitch"}
+            )
+            store._conn.execute(
+                "UPDATE leads SET timestamp=? WHERE lead_key=?",
+                (timestamp, lead),
+            )
+        store._conn.commit()
+
+        store.track_pitch("read_twice", 101, 10)
+        self.assertFalse(store.mark_read_receipt("main", 101, 9))
+        self.assertTrue(store.mark_read_receipt("main", 101, 10))
+        store.record_message("read_twice", "main", "in", "Да")
+        store.record_message("read_twice", "main", "in", "Давайте")
+        store.record_message("replied_once", "main", "in", "Расскажите")
+        store._conn.execute(
+            """UPDATE leads SET manager_notified_at=1,
+                   last_notified_action='handoff_to_manager'
+               WHERE lead_key='read_twice'"""
+        )
+        store._conn.commit()
+
+        funnel = store.funnel_timeseries(
+            datetime.date(2026, 7, 1),
+            datetime.date(2026, 7, 2),
+        )
+        self.assertEqual(
+            funnel["totals"],
+            {
+                "sent": 3,
+                "read": 2,
+                "first_reply": 2,
+                "second_reply": 1,
+                "recommendation": 1,
+                "rates": {
+                    "read": 66.7,
+                    "first_reply": 66.7,
+                    "second_reply": 33.3,
+                    "recommendation": 33.3,
+                },
+            },
+        )
+        self.assertEqual(funnel["series"][0]["second_reply_cr"], 50.0)
+        self.assertEqual(
+            store.funnel_timeseries(
+                datetime.date(2026, 7, 1),
+                datetime.date(2026, 7, 2),
+                "personal",
+            )["totals"]["sent"],
+            1,
+        )
 
     def test_admin_notification_outbox_completes_status_atomically(self):
         store = self.make_store()
