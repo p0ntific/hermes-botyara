@@ -294,9 +294,21 @@ class AccountWorker:
         sender_id = str(sender.id) if sender else ""
         sender_username = sender.username if sender and sender.username else sender_id
 
+        new_inbound = False
         lead = self.store.find_lead(sender_username, sender_id)
         if lead is None:
-            return
+            if not sales.is_product_inquiry(
+                event.raw_text,
+                self.settings.product_name,
+            ):
+                return
+            self.store.add_inbound_lead(
+                sender_username,
+                int(sender_id) if sender_id else None,
+                self.name,
+            )
+            lead = self.store.get_lead(sender_username)
+            new_inbound = True
 
         if lead["account"] is None:
             # Lead migrated from the single-account era: bind it to whichever
@@ -314,7 +326,13 @@ class AccountWorker:
 
         logger.info(f"[{self.name}] queued reply from {sender_username}: {event.raw_text}")
         self.store.mark_read(target_key)
-        self.store.record_message(target_key, self.name, "in", event.raw_text)
+        self.store.record_message(
+            target_key,
+            self.name,
+            "in",
+            event.raw_text,
+            meta={"kind": "inbound_interest"} if new_inbound else None,
+        )
 
         state = self.pending_reply_tasks.get(target_key)
         if (

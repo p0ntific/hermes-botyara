@@ -299,6 +299,18 @@ class Store:
             )
             self._conn.commit()
 
+    def add_inbound_lead(self, lead_key, peer_id, account):
+        lead_key = _lead_key(lead_key)
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO leads
+                       (lead_key, peer_id, account, status, timestamp,
+                        reply_count, last_reply_date)
+                   VALUES (?,?,?,'in_dialog',?,0,?)""",
+                (lead_key, peer_id, account, time.time(), _today()),
+            )
+            self._conn.commit()
+
     def remove_lead_if_status(self, lead_key, account, status):
         lead_key = _lead_key(lead_key)
         with self._lock:
@@ -967,15 +979,24 @@ class Store:
             rows = self._conn.execute(
                 f"""SELECT l.timestamp AS pitched_at, l.read_at,
                            l.manager_notified_at, l.last_notified_action,
-                           COUNT(i.id) AS inbound_count
+                           COUNT(i.id) AS inbound_count,
+                           MAX(CASE WHEN i.meta LIKE '%"kind": "inbound_interest"%'
+                               THEN 1 ELSE 0 END) AS inbound_interest
                     FROM leads l
                     LEFT JOIN transcripts i
                       ON i.lead_key=l.lead_key AND i.direction='in'
                     WHERE l.timestamp>=? AND l.timestamp<?{account_sql}
-                      AND EXISTS (
-                        SELECT 1 FROM transcripts p
-                        WHERE p.lead_key=l.lead_key AND p.direction='out'
-                          AND p.meta LIKE '%"kind": "pitch"%'
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM transcripts p
+                          WHERE p.lead_key=l.lead_key AND p.direction='out'
+                            AND p.meta LIKE '%"kind": "pitch"%'
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM transcripts organic
+                          WHERE organic.lead_key=l.lead_key
+                            AND organic.meta LIKE '%"kind": "inbound_interest"%'
+                        )
                       )
                     GROUP BY l.lead_key
                     ORDER BY l.timestamp""",
@@ -1001,10 +1022,11 @@ class Store:
             ).date().isoformat()
             bucket = days[key]
             inbound_count = int(row["inbound_count"])
+            inbound_interest = bool(row["inbound_interest"])
             bucket["sent"] += 1
-            bucket["read"] += int(bool(row["read_at"]) or inbound_count >= 1)
-            bucket["first_reply"] += int(inbound_count >= 1)
-            bucket["second_reply"] += int(inbound_count >= 2)
+            bucket["read"] += int(inbound_interest or bool(row["read_at"]) or inbound_count >= 1)
+            bucket["first_reply"] += int(inbound_interest or inbound_count >= 1)
+            bucket["second_reply"] += int(inbound_interest or inbound_count >= 2)
             bucket["recommendation"] += int(
                 bool(row["manager_notified_at"])
                 and row["last_notified_action"] == "handoff_to_manager"

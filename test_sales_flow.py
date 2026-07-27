@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import os
 import sys
@@ -136,6 +137,23 @@ class SalesFlowDecisionTests(unittest.TestCase):
         self.assertEqual(decision["status"], "in_dialog")
         self.assertFalse(decision["notify_manager"])
         self.assertTrue(decision["reply_text"])
+
+    def test_only_explicit_pulsar_inquiries_enter_inbound_dialog(self):
+        for message in (
+            "Расскажите, пожалуйста, как работает Пульсар?",
+            "Интересует ваш сервис Pulsar",
+            "Какая цена на pulsar-tg.ru?",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(sales.is_product_inquiry(message, "Пульсар"))
+
+        for message in (
+            "Здравствуйте, у вас есть минутка?",
+            "Предлагаю разработку сайта для Пульсара",
+            "Какая сегодня погода?",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(sales.is_product_inquiry(message, "Пульсар"))
 
     def test_ready_to_test_handoffs_to_manager(self):
         self.set_stage("ready_to_test")
@@ -996,6 +1014,64 @@ class ProcessPrivateReplySmokeTests(unittest.TestCase):
         lead = self.store.get_lead("legacy_lead")
         self.assertEqual(lead["account"], "main")
         self.assertEqual(lead["peer_id"], 777)
+
+    def test_unknown_pulsar_inquiry_enters_normal_dialog(self):
+        self.brain.generate_conversational_reply = (
+            lambda history, lead_key=None, manager_username=None: worker_decision(
+                "send_reply",
+                reply_text="Пульсар ищет потенциальных клиентов в Telegram-чатах.",
+            )
+        )
+        self.worker.client.history = [
+            FakeMessage("Расскажите, как работает Пульсар?", out=False)
+        ]
+
+        async def run_case():
+            await self.worker._pm_handler(
+                FakeEvent(
+                    FakeSender(888, "inbound_lead"),
+                    chat_id=888,
+                    text="Расскажите, как работает Пульсар?",
+                )
+            )
+            await self.worker.pending_reply_tasks["inbound_lead"]["task"]
+
+        asyncio.run(run_case())
+
+        lead = self.store.get_lead("inbound_lead")
+        self.assertEqual(lead["account"], "main")
+        self.assertEqual(lead["peer_id"], 888)
+        self.assertIsNone(lead["date"])
+        self.assertEqual(self.store.sent_today("main"), 1)
+        self.assertEqual(
+            self.worker.client.sent_messages,
+            [(888, "Пульсар ищет потенциальных клиентов в Telegram-чатах.")],
+        )
+        today = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=3))
+        ).date()
+        funnel = self.store.funnel_timeseries(today, today)
+        self.assertEqual(funnel["totals"]["sent"], 1)
+        self.assertEqual(funnel["totals"]["read"], 1)
+        self.assertEqual(funnel["totals"]["first_reply"], 1)
+        self.assertEqual(funnel["totals"]["second_reply"], 1)
+
+    def test_unknown_unrelated_message_stays_silent(self):
+        async def run_case():
+            await self.worker._pm_handler(
+                FakeEvent(
+                    FakeSender(999, "stranger"),
+                    chat_id=999,
+                    text="Здравствуйте, предлагаю настроить вам рекламу",
+                )
+            )
+            await asyncio.sleep(0)
+
+        asyncio.run(run_case())
+
+        self.assertIsNone(self.store.get_lead("stranger"))
+        self.assertNotIn("stranger", self.worker.pending_reply_tasks)
+        self.assertEqual(self.worker.client.sent_messages, [])
 
 
 class AccountConnectionTests(unittest.TestCase):

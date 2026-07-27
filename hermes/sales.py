@@ -73,6 +73,23 @@ PITCH_REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+PRODUCT_INQUIRY_RE = re.compile(
+    r"("
+    r"\?|расскаж|интерес|подроб|что\s+такое|как\s+работ|ваш\s+(?:сервис|продукт)"
+    r"|подключ|попроб|тест|стоим|цен|лид|клиент|pulsar-tg"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_product_inquiry(text, product_name):
+    text = str(text or "")
+    mentions_product = any(
+        alias and alias.casefold() in text.casefold()
+        for alias in (product_name, "Пульсар", "Pulsar", "pulsar-tg.ru")
+    )
+    return mentions_product and bool(PRODUCT_INQUIRY_RE.search(text))
+
 
 def pitch_context_payload(lead_context):
     source_match = re.search(
